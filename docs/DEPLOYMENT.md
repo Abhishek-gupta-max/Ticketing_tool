@@ -133,6 +133,16 @@ The API shuts down gracefully on `SIGTERM` (stops jobs, finishes open requests, 
 
 `npm run build` produces static files in `frontend/dist`. Serve them from Nginx (below) with a fallback to `index.html` for client-side routes. Alternatively set `SERVE_FRONTEND=true` and the API serves `frontend/dist` itself on the same port.
 
+### Frontend on Vercel
+
+`vercel.json` builds the frontend workspace (`npm run build`) and serves `frontend/dist`, with a fallback to `index.html` for client-side routes. Vercel only hosts the static frontend: the Express API and MySQL must run elsewhere (a VPS, Render, Railway...). Point the app at the API by adding a rewrite **before** the existing one in `vercel.json`, so the browser keeps talking to one origin and the session cookie stays first-party:
+
+```json
+{ "source": "/api/:path*", "destination": "https://your-api-host.example.com/api/:path*" }
+```
+
+On the API server set `FRONTEND_URL` to the Vercel URL and `COOKIE_SECURE=true`.
+
 ## Reverse proxy and HTTPS
 
 The browser app and the API should share one origin, so the session cookie stays first-party and CORS is not needed in production. Nginx example:
