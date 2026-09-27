@@ -1,0 +1,5 @@
+{
+  "type": "module",
+  "private": true,
+  "description": "Seed modules are loaded by backend/scripts/seed.js"
+}

@@ -1,0 +1,27 @@
+{
+  "name": "ticketing-tools",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Veltrixsecure Service Desk: React + Node.js + MySQL",
+  "workspaces": [
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,web -c cyan,magenta \"npm run dev -w backend\" \"npm run dev -w frontend\"",
+    "build": "npm run build -w frontend",
+    "start": "npm run start -w backend",
+    "test": "npm run test -w backend && npm run test -w frontend",
+    "db:migrate": "npm run db:migrate -w backend",
+    "db:seed": "npm run db:seed -w backend",
+    "db:seed:demo": "npm run db:seed:demo -w backend",
+    "db:status": "npm run db:status -w backend",
+    "db:schema": "npm run db:schema -w backend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# environment files (never commit secrets); templates are committed
+.env
+.env.*
+!.env.example
+!.env.*.example
+# holds only the public API path (no secrets); needed by "vite build"
+!frontend/.env.production
+
+# build output
+frontend/dist/
+coverage/
+
+# runtime data
+backend/src/uploads/*
+!backend/src/uploads/.gitkeep
+backend/logs/
+*.log
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
