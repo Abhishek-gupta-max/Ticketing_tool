@@ -24,3 +24,6 @@ backend/logs/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Vercel build output (any root directory)
+dist/
