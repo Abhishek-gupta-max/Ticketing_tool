@@ -135,7 +135,7 @@ The API shuts down gracefully on `SIGTERM` (stops jobs, finishes open requests, 
 
 ### Frontend on Vercel
 
-`vercel.json` builds the frontend workspace (`npm run build`) and serves `frontend/dist`, with a fallback to `index.html` for client-side routes. Vercel only hosts the static frontend: the Express API and MySQL must run elsewhere (a VPS, Render, Railway...). Point the app at the API by adding a rewrite **before** the existing one in `vercel.json`, so the browser keeps talking to one origin and the session cookie stays first-party:
+Set the Vercel project's Root Directory to the repository root (leave it empty) and leave the Build, Install and Output settings on their defaults: `vercel.json` runs `vercel-build.mjs`, which builds `frontend` into `dist` and adds a fallback to `index.html` for client-side routes. The script also works when the Root Directory is `backend` or `frontend`. In that case Vercel's `npm install` covers only that workspace, so the script first installs all workspaces from the repository root, as pinned by `package-lock.json`. Vercel only hosts the static frontend: the Express API and MySQL must run elsewhere (a VPS, Render, Railway...). Point the app at the API by adding a rewrite **before** the existing one in `vercel.json`, so the browser keeps talking to one origin and the session cookie stays first-party:
 
 ```json
 { "source": "/api/:path*", "destination": "https://your-api-host.example.com/api/:path*" }
