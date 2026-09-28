@@ -24,10 +24,11 @@ export default function Login() {
   const { user, login } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
-  // Development convenience only: frontend/.env.development can pre-fill the form.
-  // In production builds import.meta.env.DEV is false and these values are dropped.
-  const [email, setEmail] = useState(import.meta.env.DEV ? import.meta.env.VITE_DEV_LOGIN_EMAIL || '' : '');
-  const [password, setPassword] = useState(import.meta.env.DEV ? import.meta.env.VITE_DEV_LOGIN_PASSWORD || '' : '');
+  // The form is pre-filled with the admin account in every build, including the
+  // deployed site. Anyone who can open the site or read its JavaScript gets these
+  // credentials: remove them before real use and change the admin password.
+  const [email, setEmail] = useState('admin@veltrixsecure.example');
+  const [password, setPassword] = useState('Veltrix@Admin2026');
   const [errors, setErrors] = useState({});
   const [busy, setBusy] = useState(false);
 

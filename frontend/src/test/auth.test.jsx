@@ -15,7 +15,9 @@ describe('Login', () => {
   it('validates the form before calling the API', async () => {
     authService.me.mockRejectedValue(new Error('401'));
     renderRoute(<Login />, { path: '/login' });
-    await userEvent.click(await screen.findByRole('button', { name: /sign in/i }));
+    await userEvent.clear(await screen.findByLabelText('Email'));
+    await userEvent.clear(screen.getByLabelText('Password'));
+    await userEvent.click(screen.getByRole('button', { name: /sign in/i }));
     expect(screen.getByText('Enter a valid email address.')).toBeInTheDocument();
     expect(screen.getByText('Enter your password.')).toBeInTheDocument();
     expect(authService.login).not.toHaveBeenCalled();
@@ -25,7 +27,9 @@ describe('Login', () => {
     authService.me.mockRejectedValue(new Error('401'));
     authService.login.mockRejectedValue(new Error('Email or password is incorrect.'));
     renderRoute(<Login />, { path: '/login' });
-    await userEvent.type(await screen.findByLabelText('Email'), 'a@b.co');
+    await userEvent.clear(await screen.findByLabelText('Email'));
+    await userEvent.clear(screen.getByLabelText('Password'));
+    await userEvent.type(screen.getByLabelText('Email'), 'a@b.co');
     await userEvent.type(screen.getByLabelText('Password'), 'wrong-pass');
     await userEvent.click(screen.getByRole('button', { name: /sign in/i }));
     expect(await screen.findByText('Email or password is incorrect.')).toBeInTheDocument();
@@ -35,7 +39,9 @@ describe('Login', () => {
     authService.me.mockRejectedValue(new Error('401'));
     authService.login.mockResolvedValue(ADMIN);
     renderRoute(<Login />, { path: '/login', url: '/login' });
-    await userEvent.type(await screen.findByLabelText('Email'), 'admin@example.com');
+    await userEvent.clear(await screen.findByLabelText('Email'));
+    await userEvent.clear(screen.getByLabelText('Password'));
+    await userEvent.type(screen.getByLabelText('Email'), 'admin@example.com');
     await userEvent.type(screen.getByLabelText('Password'), 'correct-horse-1');
     await userEvent.click(screen.getByRole('button', { name: /sign in/i }));
     await waitFor(() => expect(authService.login).toHaveBeenCalledWith('admin@example.com', 'correct-horse-1'));
