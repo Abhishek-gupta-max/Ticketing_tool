@@ -2,7 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
   "installCommand": "npm install",
-  "buildCommand": "F=frontend; [ -d \"$F\" ] || F=../frontend; V=$(node -p \"require(\\\"path\\\").join(require(\\\"path\\\").dirname(require.resolve(\\\"vite/package.json\\\",{paths:[require(\\\"path\\\").resolve(\\\"$F\\\")]})),\\\"bin/vite.js\\\")\") && node \"$V\" build \"$F\" --outDir \"$PWD/dist\" --emptyOutDir",
+  "buildCommand": "node $([ -f vercel-build.mjs ] && echo . || echo ..)/vercel-build.mjs",
   "outputDirectory": "dist",
   "rewrites": [
     {
