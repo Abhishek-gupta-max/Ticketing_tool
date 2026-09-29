@@ -3,6 +3,9 @@ import { AppError } from '../utils/AppError.js';
 import { logger } from '../config/logger.js';
 import { env } from '../config/env.js';
 
+// Connection failures: the database host is wrong, unreachable or refusing us.
+const DB_UNREACHABLE = new Set(['ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'EHOSTUNREACH', 'PROTOCOL_CONNECTION_LOST', 'ER_ACCESS_DENIED_ERROR', 'ER_BAD_DB_ERROR', 'HANDSHAKE_SSL_ERROR']);
+
 export function notFoundHandler(req, res) {
   res.status(404).json({ success: false, message: 'The requested endpoint does not exist.', errorCode: 'ROUTE_NOT_FOUND' });
 }
@@ -32,6 +35,9 @@ export function errorHandler(err, req, res, next) {
   } else if (err?.type === 'entity.parse.failed') {
     status = 400;
     body = { success: false, message: 'The request body is not valid JSON.', errorCode: 'INVALID_JSON' };
+  } else if (DB_UNREACHABLE.has(err?.code)) {
+    status = 503;
+    body = { success: false, message: 'The database is unavailable. Please try again later.', errorCode: 'DB_DOWN' };
   } else if (err?.code === 'ER_DUP_ENTRY') {
     status = 409;
     body = { success: false, message: 'A record with the same unique value already exists.', errorCode: 'DUPLICATE' };
