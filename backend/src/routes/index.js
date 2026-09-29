@@ -27,10 +27,25 @@ import settingsRoutes from './settings.routes.js';
 
 const r = Router();
 
+const DB_REASONS = {
+  ECONNREFUSED: 'Connection refused: nothing is listening on DB_HOST:DB_PORT (localhost is not reachable from a hosting service).',
+  ENOTFOUND: 'DB_HOST was not found. Check the host name.',
+  EAI_AGAIN: 'DB_HOST could not be resolved. Check the host name.',
+  ETIMEDOUT: 'Connection timed out. Check DB_HOST, DB_PORT and that the database accepts connections from the internet.',
+  ER_ACCESS_DENIED_ERROR: 'The database rejected DB_USER / DB_PASSWORD.',
+  ER_BAD_DB_ERROR: 'DB_NAME does not exist on the server.',
+  HANDSHAKE_SSL_ERROR: 'TLS failed. Check DB_SSL.',
+};
+const dbReason = (err) => DB_REASONS[err?.code] || (err?.code ? `Database error ${err.code}` : 'Unknown database error');
+
 // ---------- public ----------
 r.get('/health', async (req, res) => {
   try { await pingDatabase(); res.json({ success: true, message: 'OK', data: { status: 'ok', database: 'up' } }); }
-  catch { res.status(503).json({ success: false, message: 'Database unavailable', errorCode: 'DB_DOWN' }); }
+  catch (err) {
+    // The driver's error code only (never host names or credentials), so a
+    // failed deployment can be diagnosed from the browser.
+    res.status(503).json({ success: false, message: 'Database unavailable', errorCode: 'DB_DOWN', reason: dbReason(err) });
+  }
 });
 r.post('/auth/login', loginLimiter, validate({ body: S.auth.login }), authC.login);
 r.post('/auth/logout', authC.logout);
