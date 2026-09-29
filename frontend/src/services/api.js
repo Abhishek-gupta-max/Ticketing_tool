@@ -37,10 +37,10 @@ api.interceptors.response.use(
     const { status } = err.response;
     let data = err.response.data;
     if (data instanceof Blob) { try { data = JSON.parse(await data.text()); } catch { data = {}; } }
-    // Not an API response (HTML or plain-text 404/502 from a proxy or host):
-    // the API itself was not reached.
+    // Not an API response (HTML or plain text from a proxy or host, e.g. 404,
+    // 405 or 502): the API itself was not reached.
     if (!data || typeof data !== 'object' || typeof data.message !== 'string') {
-      if (status === 404 || status >= 500) return Promise.reject(new ApiError(UNREACHABLE, { status, errorCode: 'NETWORK' }));
+      return Promise.reject(new ApiError(UNREACHABLE, { status, errorCode: 'NETWORK' }));
     }
     if (status === 401 && !String(err.config.url).includes('/auth/')) onUnauthorized();
     const body = data || {};
