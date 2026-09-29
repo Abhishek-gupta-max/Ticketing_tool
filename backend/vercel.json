@@ -1,12 +1,18 @@
 {
   "framework": null,
   "installCommand": "npm install",
-  "buildCommand": "mkdir -p public",
+  "buildCommand": "echo \"API only: no build step\"",
   "outputDirectory": "public",
   "rewrites": [
-    { "source": "/(.*)", "destination": "/api" }
+    {
+      "source": "/(.*)",
+      "destination": "/api"
+    }
   ],
   "crons": [
-    { "path": "/api/v1/internal/jobs", "schedule": "0 3 * * *" }
+    {
+      "path": "/api/v1/internal/jobs",
+      "schedule": "0 3 * * *"
+    }
   ]
 }
