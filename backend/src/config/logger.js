@@ -32,9 +32,12 @@ if (!env.isTest) {
         return `${timestamp} ${level} ${message}${extra}`;
       })),
   }));
-  fs.mkdirSync(env.logDir, { recursive: true });
-  transports.push(new winston.transports.File({ filename: path.join(env.logDir, 'error.log'), level: 'error', maxsize: 10 * 1024 * 1024, maxFiles: 5 }));
-  transports.push(new winston.transports.File({ filename: path.join(env.logDir, 'app.log'), maxsize: 20 * 1024 * 1024, maxFiles: 5 }));
+  // On Vercel the console output is the log (Deployments > Logs); files would not be kept.
+  if (!env.onVercel) {
+    fs.mkdirSync(env.logDir, { recursive: true });
+    transports.push(new winston.transports.File({ filename: path.join(env.logDir, 'error.log'), level: 'error', maxsize: 10 * 1024 * 1024, maxFiles: 5 }));
+    transports.push(new winston.transports.File({ filename: path.join(env.logDir, 'app.log'), maxsize: 20 * 1024 * 1024, maxFiles: 5 }));
+  }
 } else {
   transports.push(new winston.transports.Console({ silent: true }));
 }

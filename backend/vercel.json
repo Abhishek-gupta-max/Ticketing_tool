@@ -1,0 +1,12 @@
+{
+  "framework": null,
+  "installCommand": "npm install",
+  "buildCommand": "mkdir -p public",
+  "outputDirectory": "public",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api" }
+  ],
+  "crons": [
+    { "path": "/api/v1/internal/jobs", "schedule": "0 3 * * *" }
+  ]
+}

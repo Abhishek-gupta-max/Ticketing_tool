@@ -24,6 +24,8 @@ export function getPool() {
       bigNumberStrings: false,
       charset: 'utf8mb4_unicode_ci',
       namedPlaceholders: false,
+      // Hosted MySQL services require TLS; the server certificate is verified.
+      ssl: env.DB_SSL ? { rejectUnauthorized: true } : undefined,
     });
     pool.on('connection', (conn) => {
       conn.query("SET SESSION time_zone = '+00:00'");

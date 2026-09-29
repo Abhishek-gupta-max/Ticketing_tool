@@ -8,7 +8,7 @@ function maxAgeMs(expr) {
   return Number(m[1]) * { s: 1000, m: 60000, h: 3600000, d: 86400000 }[m[2] || 's'];
 }
 
-const cookieOptions = () => ({ httpOnly: true, secure: env.COOKIE_SECURE, sameSite: 'lax', path: '/', maxAge: maxAgeMs(env.JWT_EXPIRES_IN) });
+const cookieOptions = () => ({ httpOnly: true, secure: env.COOKIE_SECURE, sameSite: env.COOKIE_SAME_SITE, path: '/', maxAge: maxAgeMs(env.JWT_EXPIRES_IN) });
 const setSession = (res, token) => res.cookie(env.COOKIE_NAME, token, cookieOptions());
 const clearSession = (res) => res.clearCookie(env.COOKIE_NAME, { ...cookieOptions(), maxAge: undefined });
 

@@ -38,7 +38,7 @@ export function createApp() {
   app.use(cors({
     origin: (origin, cb) => cb(null, !origin || env.frontendOrigins.includes(origin)),
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'X-Requested-With', 'X-Request-Id'],
     exposedHeaders: ['Content-Disposition', 'X-Request-Id'],
     maxAge: 600,

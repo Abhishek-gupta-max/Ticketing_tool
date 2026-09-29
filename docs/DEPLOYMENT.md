@@ -135,13 +135,41 @@ The API shuts down gracefully on `SIGTERM` (stops jobs, finishes open requests, 
 
 ### Frontend on Vercel
 
-Set the Vercel project's Root Directory to the repository root (leave it empty) and leave the Build, Install and Output settings on their defaults: `vercel.json` runs `vercel-build.mjs`, which builds `frontend` into `dist` and adds a fallback to `index.html` for client-side routes. The script also works when the Root Directory is `backend` or `frontend`. In that case Vercel's `npm install` covers only that workspace, so the script first installs all workspaces from the repository root, as pinned by `package-lock.json`. Vercel only hosts the static frontend: the Express API and MySQL must run elsewhere (a VPS, Render, Railway...). Point the app at the API by adding a rewrite **before** the existing one in `vercel.json`, so the browser keeps talking to one origin and the session cookie stays first-party:
+Set the Vercel project's Root Directory to the repository root (leave it empty) and leave the Build, Install and Output settings on their defaults: `vercel.json` runs `vercel-build.mjs`, which builds `frontend` into `dist` and adds a fallback to `index.html` for client-side routes. The script also works when the Root Directory is `backend` or `frontend`. In that case Vercel's `npm install` covers only that workspace, so the script first installs all workspaces from the repository root, as pinned by `package-lock.json`. The first rewrite in `vercel.json` forwards `/api/*` to the backend project (`https://ticketing-tool-backend-taupe.vercel.app`). The browser therefore talks to one origin, the session cookie stays first-party (`SameSite=Lax`) and no CORS is involved. If the backend URL changes, update that rewrite in both `vercel.json` and `frontend/vercel.json`.
 
-```json
-{ "source": "/api/:path*", "destination": "https://your-api-host.example.com/api/:path*" }
+To call the backend directly instead, set `VITE_API_BASE_URL` to the backend origin in the frontend project. The backend then needs `COOKIE_SAME_SITE=none`, which relies on third-party cookies: Safari and browsers that block them will not keep the session.
+
+### Backend on Vercel
+
+Create a second Vercel project from the same repository with Root Directory `backend`. `backend/vercel.json` routes every request to `backend/api/index.js`, which exports the Express app as a serverless function. The MySQL database must be reachable from the internet (a hosted MySQL such as Aiven, TiDB Cloud, Railway or PlanetScale). XAMPP on your own PC is not reachable from Vercel. Create the schema once from your machine against that database:
+
+```bash
+cd backend
+DB_HOST=<host> DB_PORT=<port> DB_USER=<user> DB_PASSWORD=<password> DB_NAME=<name> DB_SSL=true npm run db:migrate
+DB_HOST=... SEED_ADMIN_PASSWORD='<admin password>' npm run db:seed
 ```
 
-On the API server set `FRONTEND_URL` to the Vercel URL and `COOKIE_SECURE=true`.
+To move existing local data instead, export it with `mysqldump` (see Database backup) and import it into the hosted database.
+
+Environment variables (Settings > Environment Variables, Production):
+
+| Variable | Value |
+|---|---|
+| `NODE_ENV` | `production` |
+| `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | hosted MySQL connection (`MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE` are accepted too) |
+| `DB_SSL` | `true` when the provider requires TLS |
+| `JWT_SECRET` | 48+ random bytes |
+| `COOKIE_SECURE` | `true` |
+| `FRONTEND_URL` | `https://ticketing-tool-frontend-nine.vercel.app` |
+| `CRON_SECRET` | random string; Vercel Cron sends it to `/api/v1/internal/jobs` |
+
+Do not set `UPLOAD_DIR`, `LOG_DIR` or `PORT` there. Limits of serverless hosting:
+
+- Attachments are written to the function's temporary directory and are **not kept**. They disappear when the instance is recycled. For lasting attachments use object storage (Vercel Blob, S3) or host the API on a server.
+- Vercel limits a request body to 4.5 MB, so larger uploads fail.
+- Background jobs (auto-close, SLA notifications) run from `crons` in `backend/vercel.json`, once a day on the Hobby plan.
+- Logs are in the Vercel dashboard (Deployments > Logs); no log files are written.
+- Rate limits are counted per function instance.
 
 ## Reverse proxy and HTTPS
 
