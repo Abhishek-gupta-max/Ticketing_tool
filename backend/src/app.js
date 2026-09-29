@@ -72,6 +72,9 @@ export function createApp() {
     app.get(/^(?!\/api\/).*/, (req, res) => res.sendFile(path.join(dist, 'index.html')));
   }
 
+  // API-only host: say what this is instead of Express's "Cannot GET /".
+  app.get('/', (req, res) => res.json({ success: true, message: 'Veltrixsecure Service Desk API', data: { api: '/api/v1', health: '/api/v1/health' } }));
+
   app.use(errorHandler);
   return app;
 }
