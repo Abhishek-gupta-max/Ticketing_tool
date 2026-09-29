@@ -71,22 +71,27 @@ const schema = z.object({
   SEED_DEMO_PASSWORD: z.string().default(''),
 });
 
+// A serverless function cannot exit: it throws instead, and api/index.js
+// answers every request with the message (setting names only, never values).
+function fail(message) {
+  console.error(message);
+  if (onVercel) throw new Error(message);
+  process.exit(1);
+}
+
 const parsed = schema.safeParse(process.env);
 if (!parsed.success) {
   // Printed before the logger exists; never includes values, only names.
-  console.error('Invalid environment configuration:', parsed.error.issues.map((i) => i.path.join('.')).join(', '));
-  process.exit(1);
+  fail(`Invalid environment configuration: ${parsed.error.issues.map((i) => i.path.join('.')).join(', ')}`);
 }
 const e = parsed.data;
 
 if (e.NODE_ENV === 'test' && !e.JWT_SECRET) e.JWT_SECRET = 'test-only-secret-not-used-anywhere-else-0123456789';
 if (e.JWT_SECRET.length < 32) {
-  console.error('JWT_SECRET is missing or shorter than 32 characters. Set it in backend/.env (see .env.example).');
-  process.exit(1);
+  fail('JWT_SECRET is missing or shorter than 32 characters. Set it in backend/.env or in the hosting environment variables (see .env.example).');
 }
 if (e.COOKIE_SAME_SITE === 'none' && !e.COOKIE_SECURE) {
-  console.error('COOKIE_SAME_SITE=none requires COOKIE_SECURE=true.');
-  process.exit(1);
+  fail('COOKIE_SAME_SITE=none requires COOKIE_SECURE=true.');
 }
 if (e.NODE_ENV === 'production' && !e.COOKIE_SECURE) {
   console.warn('COOKIE_SECURE is false in production. Session cookies will be sent over plain HTTP.');
