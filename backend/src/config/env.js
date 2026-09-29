@@ -79,10 +79,25 @@ function fail(message) {
   process.exit(1);
 }
 
-const parsed = schema.safeParse(process.env);
+// Values pasted into a hosting dashboard often carry spaces, quotes or
+// capitals ("True", "\"5\""); an empty value means "use the default".
+function normalise(name, value) {
+  if (value === undefined) return undefined;
+  if (/PASSWORD|SECRET/.test(name)) return value === '' ? undefined : value; // used exactly as entered
+  let v = value.trim();
+  if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v.at(-1) === v[0]) v = v.slice(1, -1).trim();
+  if (v === '') return undefined;
+  if (/^(true|false)$/i.test(v)) v = v.toLowerCase();
+  if (['LOG_LEVEL', 'NODE_ENV', 'COOKIE_SAME_SITE'].includes(name)) v = v.toLowerCase();
+  return v;
+}
+const input = Object.fromEntries(Object.keys(schema.shape).map((k) => [k, normalise(k, process.env[k])]));
+
+const parsed = schema.safeParse(input);
 if (!parsed.success) {
   // Printed before the logger exists; never includes values, only names.
-  fail(`Invalid environment configuration: ${parsed.error.issues.map((i) => i.path.join('.')).join(', ')}`);
+  const expected = (i) => (i.code === 'invalid_enum_value' ? `one of ${i.options.join(', ')}` : i.expected || 'a positive number');
+  fail(`Invalid environment configuration: ${parsed.error.issues.map((i) => `${i.path.join('.')} must be ${expected(i)}`).join('; ')}`);
 }
 const e = parsed.data;
 
