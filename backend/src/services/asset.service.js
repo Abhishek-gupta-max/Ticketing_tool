@@ -1,4 +1,4 @@
-import { withTransaction, queryOne, query } from '../config/database.js';
+import { withTransaction, find, findOne, count, equalsCi } from '../config/database.js';
 import * as repo from '../repositories/asset.repository.js';
 import * as ticketRepo from '../repositories/ticket.repository.js';
 import * as customerRepo from '../repositories/customer.repository.js';
@@ -46,7 +46,7 @@ export async function get(tag) {
     changes: changes.map((c) => ({ number: c.change_number, title: c.title, status: c.status, closeCode: c.close_code, plannedStart: c.planned_start })),
     devices: devices.map((d) => ({ tag: d.asset_tag, name: d.name })),
     openTicketList: open.rows.map((t) => map.ticket(t)),
-    ticketTotal: open.total + (await queryOne('SELECT COUNT(*) AS n FROM tickets WHERE asset_id = ? AND deleted_at IS NULL AND status IN (\'Resolved\',\'Closed\')', [r.id])).n,
+    ticketTotal: open.total + await count('tickets', { asset_id: r.id, deleted_at: null, status: { $in: ['Resolved', 'Closed'] } }),
     resolvedTickets: resolved.rows.map((t) => map.ticket(t)),
   };
 }
@@ -106,7 +106,7 @@ export async function importCsv(text, user) {
   const ix = (k) => head.indexOf(k);
   if (ix('name') < 0) return { imported: 0, errors: ['The first row must contain a "name" column.'] };
   const g = (r, k) => (ix(k) >= 0 ? (r[ix(k)] || '').trim() : '');
-  const types = await query('SELECT id, name FROM asset_types');
+  const types = await find('asset_types', {}, { projection: { id: 1, name: 1 } });
   const internal = await customerRepo.internalCustomer();
   const errors = [];
   let imported = 0;
@@ -123,7 +123,10 @@ export async function importCsv(text, user) {
       const status = ASSET_STATUSES.find((s) => s.toLowerCase() === g(r, 'status').toLowerCase()) || 'In use';
       const cust = (g(r, 'customer') && await customerRepo.findCustomerByName(g(r, 'customer'))) || internal;
       const person = async (m) => (m ? (await customerRepo.findPersonByEmail(m))?.id || null : null);
-      const agentByMail = async (m) => (m ? (await queryOne('SELECT u.id FROM users u JOIN agents a ON a.user_id = u.id WHERE LOWER(u.email) = LOWER(?)', [m]))?.id || null : null);
+      const agentByMail = async (m) => {
+        const u = m ? await findOne('users', { email: equalsCi(m) }, { projection: { id: 1 } }) : null;
+        return u && (await findOne('agents', { user_id: u.id })) ? u.id : null;
+      };
       const grp = g(r, 'support_group') ? await teamRepo.findByName(g(r, 'support_group')) : null;
       const warranty = g(r, 'warranty');
       if (warranty && Number.isNaN(Date.parse(warranty))) { errors.push(`Row ${i + 1}: warranty "${warranty}" is not a date`); continue; }

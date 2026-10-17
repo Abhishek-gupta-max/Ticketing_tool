@@ -12,11 +12,6 @@ const nodeEnv = process.env.NODE_ENV || 'development';
 dotenv.config({ path: path.join(BACKEND_ROOT, `.env.${nodeEnv}`), quiet: true });
 dotenv.config({ path: path.join(BACKEND_ROOT, '.env'), quiet: true });
 
-// Hosted MySQL providers often name these MYSQL_*; DB_* wins when both are set.
-for (const [alias, name] of [['MYSQL_HOST', 'DB_HOST'], ['MYSQL_PORT', 'DB_PORT'], ['MYSQL_USER', 'DB_USER'], ['MYSQL_PASSWORD', 'DB_PASSWORD'], ['MYSQL_DATABASE', 'DB_NAME']]) {
-  if (process.env[name] === undefined && process.env[alias] !== undefined) process.env[name] = process.env[alias];
-}
-
 // Vercel runs the API as a serverless function: the file system is read-only
 // except the temporary directory, and nothing written there is kept.
 const onVercel = Boolean(process.env.VERCEL);
@@ -28,14 +23,11 @@ const schema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: int(5000),
 
-  DB_HOST: z.string().default('localhost'),
-  DB_PORT: int(3306),
-  DB_USER: z.string().default('root'),
-  DB_PASSWORD: z.string().default(''),
-  DB_NAME: z.string().default('tickenting_tools'),
-  DB_NAME_TEST: z.string().default('tickenting_tools_test'),
+  // mongodb://host:27017 or mongodb+srv://user:password@cluster.example.mongodb.net
+  MONGODB_URI: z.string().default('mongodb://localhost:27017'),
+  MONGODB_DB: z.string().default('Ticketing_tools'),
+  MONGODB_DB_TEST: z.string().default('Ticketing_tools_test'),
   DB_CONNECTION_LIMIT: int(onVercel ? 3 : 10),
-  DB_SSL: bool('false'),
 
   JWT_SECRET: z.string().default(''),
   JWT_EXPIRES_IN: z.string().default('1d'),
@@ -83,7 +75,7 @@ function fail(message) {
 // capitals ("True", "\"5\""); an empty value means "use the default".
 function normalise(name, value) {
   if (value === undefined) return undefined;
-  if (/PASSWORD|SECRET/.test(name)) return value === '' ? undefined : value; // used exactly as entered
+  if (/PASSWORD|SECRET|URI/.test(name)) return value === '' ? undefined : value; // used exactly as entered
   let v = value.trim();
   if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v.at(-1) === v[0]) v = v.slice(1, -1).trim();
   if (v === '') return undefined;
@@ -117,7 +109,7 @@ export const env = Object.freeze({
   isProduction: e.NODE_ENV === 'production',
   isTest: e.NODE_ENV === 'test',
   onVercel,
-  dbName: e.NODE_ENV === 'test' ? e.DB_NAME_TEST : e.DB_NAME,
+  dbName: e.NODE_ENV === 'test' ? e.MONGODB_DB_TEST : e.MONGODB_DB,
   frontendOrigins: e.FRONTEND_URL.split(',').map((s) => s.trim()).filter(Boolean),
   uploadDir: path.resolve(BACKEND_ROOT, e.UPLOAD_DIR),
   logDir: path.resolve(BACKEND_ROOT, e.LOG_DIR),

@@ -1,4 +1,4 @@
-import { withTransaction, queryOne } from '../config/database.js';
+import { withTransaction, findOne } from '../config/database.js';
 import * as repo from '../repositories/task.repository.js';
 import * as ticketRepo from '../repositories/ticket.repository.js';
 import * as problemRepo from '../repositories/problem.repository.js';
@@ -147,7 +147,9 @@ export async function update(number, body, user) {
     if (body.assigneeId !== undefined && body.assigneeId !== t.assigned_to) {
       let name = 'Unassigned';
       if (body.assigneeId) {
-        const u = await queryOne("SELECT u.name, a.primary_team_id FROM users u JOIN agents a ON a.user_id = u.id WHERE u.id = ? AND u.status = 'active'", [body.assigneeId], conn);
+        const agent = await findOne('agents', { user_id: body.assigneeId }, { projection: { primary_team_id: 1 } }, conn);
+        const active = agent && await findOne('users', { id: body.assigneeId, status: 'active' }, { projection: { name: 1 } }, conn);
+        const u = active ? { name: active.name, primary_team_id: agent.primary_team_id } : null;
         if (!u) throw badRequest('Choose an active agent.');
         name = u.name;
         const fresh = await repo.findById(t.id, conn);

@@ -1,41 +1,37 @@
-import { query, queryOne } from '../config/database.js';
+import { insertOne, find, count, attach, like } from '../config/database.js';
 
-export const insert = (row, conn) => query(
-  `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, entity_ref, old_values, new_values, ip_address, user_agent, request_id)
-   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  [row.userId ?? null, row.action, row.entityType, row.entityId != null ? String(row.entityId) : null, row.entityRef ?? null,
-    row.oldValues ? JSON.stringify(row.oldValues) : null, row.newValues ? JSON.stringify(row.newValues) : null,
-    row.ip ?? null, row.userAgent ?? null, row.requestId ?? null],
-  conn,
-);
+// audit_logs is append-only: this module only inserts and reads.
+export const insert = (row, conn) => insertOne('audit_logs', {
+  user_id: row.userId ?? null, action: row.action, entity_type: row.entityType, entity_id: row.entityId != null ? String(row.entityId) : null,
+  entity_ref: row.entityRef ?? null, old_values: row.oldValues ? JSON.stringify(row.oldValues) : null,
+  new_values: row.newValues ? JSON.stringify(row.newValues) : null, ip_address: row.ip ?? null, user_agent: row.userAgent ?? null,
+  request_id: row.requestId ?? null,
+}, conn);
 
 function where(f) {
-  const w = [], p = [];
-  if (f.userId) { w.push('a.user_id = ?'); p.push(f.userId); }
-  if (f.entityType) { w.push('a.entity_type = ?'); p.push(f.entityType); }
-  if (f.entityRef) { w.push('a.entity_ref = ?'); p.push(f.entityRef); }
-  if (f.from) { w.push('a.created_at >= ?'); p.push(f.from); }
-  if (f.to) { w.push('a.created_at < ?'); p.push(f.to); }
-  if (f.search) { w.push('(a.action LIKE ? OR a.entity_ref LIKE ?)'); p.push(`%${f.search}%`, `%${f.search}%`); }
-  return { sql: w.length ? 'WHERE ' + w.join(' AND ') : '', params: p };
+  const w = {};
+  if (f.userId) w.user_id = f.userId;
+  if (f.entityType) w.entity_type = f.entityType;
+  if (f.entityRef) w.entity_ref = f.entityRef;
+  if (f.from || f.to) w.created_at = { ...(f.from && { $gte: new Date(f.from) }), ...(f.to && { $lt: new Date(f.to) }) };
+  if (f.search) w.$or = [{ action: like(f.search) }, { entity_ref: like(f.search) }];
+  return w;
 }
+
+const LIST_FIELDS = {
+  id: 1, user_id: 1, action: 1, entity_type: 1, entity_id: 1, entity_ref: 1, old_values: 1, new_values: 1, ip_address: 1, user_agent: 1, created_at: 1,
+};
 
 export async function list(f, { limit, offset }) {
-  const { sql, params } = where(f);
-  const rows = await query(
-    `SELECT a.id, a.user_id, u.name AS user_name, a.action, a.entity_type, a.entity_id, a.entity_ref,
-            a.old_values, a.new_values, a.ip_address, a.user_agent, a.created_at
-       FROM audit_logs a LEFT JOIN users u ON u.id = a.user_id ${sql}
-      ORDER BY a.created_at DESC, a.id DESC LIMIT ? OFFSET ?`,
-    [...params, limit, offset],
-  );
-  const total = (await queryOne(`SELECT COUNT(*) AS n FROM audit_logs a ${sql}`, params)).n;
-  return { rows, total };
+  const filter = where(f);
+  const rows = await find('audit_logs', filter, { sort: { created_at: -1, id: -1 }, skip: offset, limit, projection: LIST_FIELDS });
+  await attach(rows, 'users', 'user_id', { user_name: 'name' });
+  return { rows, total: await count('audit_logs', filter) };
 }
 
-export const recent = (limit = 7) => query(
-  `SELECT a.id, a.user_id, u.name AS user_name, a.action, a.entity_type, a.entity_ref, a.created_at
-     FROM audit_logs a LEFT JOIN users u ON u.id = a.user_id
-    ORDER BY a.created_at DESC, a.id DESC LIMIT ?`,
-  [limit],
-);
+export async function recent(limit = 7) {
+  const rows = await find('audit_logs', {}, {
+    sort: { created_at: -1, id: -1 }, limit, projection: { id: 1, user_id: 1, action: 1, entity_type: 1, entity_ref: 1, created_at: 1 },
+  });
+  return attach(rows, 'users', 'user_id', { user_name: 'name' });
+}

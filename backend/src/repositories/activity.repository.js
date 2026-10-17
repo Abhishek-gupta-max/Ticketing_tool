@@ -1,7 +1,7 @@
-import { query } from '../config/database.js';
+import { insertOne, find, attach } from '../config/database.js';
 
-// Activity tables of problems, changes and tasks share a shape. Table and column
-// names come from this whitelist only, never from input.
+// Activity collections of problems, changes and tasks share a shape. Collection
+// and field names come from this whitelist only, never from input.
 const TABLES = {
   problem: { table: 'problem_activities', fk: 'problem_id', typed: true },
   change: { table: 'change_activities', fk: 'change_id', typed: true },
@@ -10,22 +10,25 @@ const TABLES = {
 
 export async function add(kind, parentId, userId, body, type = 'system', conn) {
   const t = TABLES[kind];
-  if (t.typed) return query(`INSERT INTO ${t.table} (${t.fk}, user_id, type, body) VALUES (?, ?, ?, ?)`, [parentId, userId || null, type, body], conn);
-  return query(`INSERT INTO ${t.table} (${t.fk}, user_id, body) VALUES (?, ?, ?)`, [parentId, userId || null, body], conn);
+  const doc = { [t.fk]: parentId, user_id: userId || null, body };
+  if (t.typed) doc.type = type;
+  return insertOne(t.table, doc, conn);
 }
 
 export async function list(kind, parentId) {
   const t = TABLES[kind];
-  return query(
-    `SELECT a.id, ${t.typed ? 'a.type' : "'system' AS type"}, a.body, a.created_at, a.user_id, u.name AS user_name
-       FROM ${t.table} a LEFT JOIN users u ON u.id = a.user_id WHERE a.${t.fk} = ? ORDER BY a.created_at DESC, a.id DESC`,
-    [parentId],
-  );
+  const rows = await find(t.table, { [t.fk]: parentId }, {
+    sort: { created_at: -1, id: -1 },
+    projection: { id: 1, type: 1, body: 1, created_at: 1, user_id: 1 },
+  });
+  if (!t.typed) rows.forEach((r) => { r.type = 'system'; });
+  return attach(rows, 'users', 'user_id', { user_name: 'name' });
 }
 
-export const addTaskComment = (taskId, userId, body, conn) => query('INSERT INTO task_comments (task_id, user_id, body) VALUES (?, ?, ?)', [taskId, userId, body], conn);
-export const taskComments = (taskId) => query(
-  `SELECT c.id, 'note' AS type, c.body, c.created_at, c.user_id, u.name AS user_name
-     FROM task_comments c LEFT JOIN users u ON u.id = c.user_id WHERE c.task_id = ? ORDER BY c.created_at DESC`,
-  [taskId],
-);
+export const addTaskComment = (taskId, userId, body, conn) => insertOne('task_comments', { task_id: taskId, user_id: userId, body }, conn);
+
+export async function taskComments(taskId) {
+  const rows = await find('task_comments', { task_id: taskId }, { sort: { created_at: -1 }, projection: { id: 1, body: 1, created_at: 1, user_id: 1 } });
+  rows.forEach((r) => { r.type = 'note'; });
+  return attach(rows, 'users', 'user_id', { user_name: 'name' });
+}

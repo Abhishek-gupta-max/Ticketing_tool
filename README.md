@@ -1,14 +1,14 @@
 # Veltrixsecure Service Desk
 
-A full-stack IT service desk: incidents, service requests with a catalog and approvals, tasks, problems, changes with a CAB, assets, a knowledge base, reports and an audit trail. It is the production version of the original single-file application (kept for reference in `legacy/veltrixsecure-servicedesk.html`), rebuilt as a React frontend on a Node.js / Express API backed by MySQL. The user interface, wording and workflows are preserved; all data now lives in the database instead of the browser.
+A full-stack IT service desk: incidents, service requests with a catalog and approvals, tasks, problems, changes with a CAB, assets, a knowledge base, reports and an audit trail. It is the production version of the original single-file application (kept for reference in `legacy/veltrixsecure-servicedesk.html`), rebuilt as a React frontend on a Node.js / Express API backed by MongoDB. The user interface, wording and workflows are preserved; all data now lives in the database instead of the browser.
 
 ```
-React (Vite)  ->  REST API /api/v1  ->  Express routes  ->  controllers  ->  services  ->  repositories  ->  MySQL
+React (Vite)  ->  REST API /api/v1  ->  Express routes  ->  controllers  ->  services  ->  repositories  ->  MongoDB
 ```
 
 ## Quick start
 
-Requirements: Node.js 20+, MySQL 8 or MariaDB 10.4+ with a database named `tickenting_tools` (created automatically if the user may create databases).
+Requirements: Node.js 20+ and MongoDB 6+ (`mongodb://localhost:27017`, database `Ticketing_tools`, created automatically).
 
 ```bash
 npm install
@@ -32,9 +32,9 @@ Generate a JWT secret: `node -e "console.log(require('crypto').randomBytes(48).t
 | `npm run build` | production build of the frontend into `frontend/dist` |
 | `npm run start` | start the API (use `NODE_ENV=production` in production) |
 | `npm test` | backend integration tests (real test database) and frontend tests |
-| `npm run db:migrate` / `db:status` | apply / list migrations |
+| `npm run db:migrate` / `db:status` | create / list collections and indexes |
 | `npm run db:seed` / `db:seed:demo` | reference data / sample workspace |
-| `npm run db:schema` | regenerate `database/schema.sql` from the migrations |
+| `npm run db:import-mysql` | one-time copy of the former MySQL database into MongoDB |
 
 ## Project structure
 
@@ -42,7 +42,7 @@ Generate a JWT secret: `node -e "console.log(require('crypto').randomBytes(48).t
 ticketing-tools/
 ├── backend/                 Express API (ES modules)
 │   ├── src/
-│   │   ├── config/          env validation, MySQL pool and transactions, logger
+│   │   ├── config/          env validation, MongoDB client, schema and transactions, logger
 │   │   ├── routes/          one file per module (ticket.routes.js, change.routes.js, ...)
 │   │   ├── controllers/     thin HTTP handlers
 │   │   ├── services/        business rules and workflows
@@ -54,7 +54,7 @@ ticketing-tools/
 │   │   ├── jobs/            auto-close and SLA notifications
 │   │   ├── utils/           SLA engine, CSV, file storage, migrator, seeder
 │   │   └── uploads/         attachment storage (not publicly served)
-│   ├── scripts/             migrate, seed, build-schema
+│   ├── scripts/             migrate, seed, MySQL import
 │   └── tests/               API integration tests
 ├── frontend/                React 19 + Vite
 │   └── src/
@@ -66,9 +66,7 @@ ticketing-tools/
 │       ├── hooks/ store/ routes/ utils/ constants/ validators/ test/
 │       └── assets/styles/   legacy.css (the original stylesheet, unchanged) + app.css
 ├── database/
-│   ├── migrations/          001 ... 019 numbered SQL migrations
-│   ├── seeds/               reference data (+ demo/ sample workspace)
-│   └── schema.sql           generated full schema
+│   └── seeds/               reference data (+ demo/ sample workspace)
 ├── docs/                    API.md, DATABASE.md, DEPLOYMENT.md
 └── legacy/                  the original HTML application
 ```
@@ -109,10 +107,10 @@ Changes compared with the original, by design:
 - zod validation of every request; parameterised SQL only; whitelisted sort columns
 - File uploads: extension allow and block lists, magic-byte content checks, size limits, random file names outside the web root, authorised downloads, `nosniff` and sandboxed previews
 - Errors never expose SQL, stack traces or configuration; logs redact secrets
-- Append-only audit log (enforced by database triggers) with user, IP address and user agent
+- Append-only audit log with user, IP address and user agent
 
 ## Documentation
 
 - [docs/API.md](docs/API.md): conventions and every endpoint with its permission
 - [docs/DATABASE.md](docs/DATABASE.md): schema, design decisions, transactions, numbering, mapping from the original data model
-- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): development, testing, production build, migrations, environment variables, backend and frontend deployment, Nginx and HTTPS, backups, logging
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): development, testing, production build, database setup, environment variables, backend and frontend deployment, Nginx and HTTPS, backups, logging

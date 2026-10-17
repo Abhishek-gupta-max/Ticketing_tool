@@ -1,4 +1,4 @@
-import { query } from '../config/database.js';
+import { find, count, mapBy } from '../config/database.js';
 import * as audit from './audit.service.js';
 
 const TABLES = ['customers', 'people', 'teams', 'team_members', 'ticket_categories', 'priorities', 'catalog_items', 'catalog_fields', 'catalog_tasks',
@@ -9,19 +9,21 @@ const TABLES = ['customers', 'people', 'teams', 'team_members', 'ticket_categori
 
 /** Counts for the Settings > Data tab. */
 export async function summary() {
-  const [row] = await query(`SELECT
-    (SELECT COUNT(*) FROM tickets WHERE deleted_at IS NULL) AS tickets, (SELECT COUNT(*) FROM problems WHERE deleted_at IS NULL) AS problems,
-    (SELECT COUNT(*) FROM changes WHERE deleted_at IS NULL) AS changes, (SELECT COUNT(*) FROM assets WHERE deleted_at IS NULL) AS assets,
-    (SELECT COUNT(*) FROM knowledge_articles WHERE deleted_at IS NULL) AS articles, (SELECT COUNT(*) FROM attachments WHERE deleted_at IS NULL) AS attachments,
-    (SELECT COUNT(*) FROM audit_logs) AS audit, (SELECT COUNT(*) FROM tasks) AS tasks, (SELECT COUNT(*) FROM requests) AS requests`);
-  return Object.fromEntries(Object.entries(row).map(([k, v]) => [k, Number(v)]));
+  const live = { deleted_at: null };
+  const [tickets, problems, changes, assets, articles, attachments, audit, tasks, requests] = await Promise.all([
+    count('tickets', live), count('problems', live), count('changes', live), count('assets', live), count('knowledge_articles', live),
+    count('attachments', live), count('audit_logs'), count('tasks'), count('requests'),
+  ]);
+  return { tickets, problems, changes, assets, articles, attachments, audit, tasks, requests };
 }
 
 /** Full JSON export of business data (no users, password hashes or settings secrets). */
 export async function exportAll() {
   const out = { exportedAt: new Date().toISOString(), tables: {} };
-  for (const t of TABLES) out.tables[t] = await query(`SELECT * FROM ${t}`);
-  out.tables.users = await query('SELECT u.id, u.name, u.email, r.name AS role, u.status FROM users u JOIN roles r ON r.id = u.role_id');
+  for (const t of TABLES) out.tables[t] = await find(t, {});
+  const users = await find('users', {}, { projection: { id: 1, name: 1, email: 1, role_id: 1, status: 1 } });
+  const roles = await mapBy('roles', users.map((u) => u.role_id), { projection: { name: 1 } });
+  out.tables.users = users.filter((u) => roles.has(u.role_id)).map((u) => ({ id: u.id, name: u.name, email: u.email, role: roles.get(u.role_id).name, status: u.status }));
   await audit.log({ action: 'Exported all data', entityType: 'data', entityRef: 'Data' });
   return out;
 }

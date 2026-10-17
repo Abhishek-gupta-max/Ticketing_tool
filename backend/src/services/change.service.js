@@ -1,4 +1,4 @@
-import { withTransaction, queryOne } from '../config/database.js';
+import { withTransaction, find, findOne, mapBy } from '../config/database.js';
 import * as repo from '../repositories/change.repository.js';
 import * as approvalRepo from '../repositories/approval.repository.js';
 import * as taskRepo from '../repositories/task.repository.js';
@@ -82,15 +82,16 @@ async function cabApprovers(conn) {
   const list = (await settingsRepo.getSetting('cab_approvers', conn)) || [];
   const valid = [];
   for (const a of list) {
-    const u = await queryOne("SELECT id FROM users WHERE id = ? AND status = 'active'", [a.userId], conn);
+    const u = await findOne('users', { id: a.userId, status: 'active' }, { projection: { id: 1 } }, conn);
     if (u) valid.push(a);
   }
   if (valid.length) return valid;
   // Fallback: active members of approval teams.
-  const rows = (await conn.query(
-    "SELECT DISTINCT tm.user_id FROM team_members tm JOIN teams t ON t.id = tm.team_id JOIN users u ON u.id = tm.user_id WHERE t.type = 'Approval' AND t.is_active = 1 AND u.status = 'active'",
-  ))[0];
-  return rows.map((r) => ({ userId: r.user_id, role: 'CAB member' }));
+  const teams = await find('teams', { type: 'Approval', is_active: 1 }, { projection: { id: 1 } }, conn);
+  const links = await find('team_members', { team_id: { $in: teams.map((t) => t.id) } }, { projection: { user_id: 1 } }, conn);
+  const users = await mapBy('users', links.map((l) => l.user_id), { projection: { status: 1 }, conn });
+  const ids = [...new Set(links.map((l) => l.user_id))].filter((id) => users.get(id)?.status === 'active');
+  return ids.map((id) => ({ userId: id, role: 'CAB member' }));
 }
 
 /** body: change fields + { ticketNumbers, problemNumber, assetIds, submit } */
@@ -176,7 +177,7 @@ export async function setOwner(number, ownerId, user) {
   await withTransaction(async (conn) => {
     const c = await load(number, conn);
     assertEditable(c);
-    const u = await queryOne("SELECT name FROM users WHERE id = ? AND status = 'active'", [ownerId], conn);
+    const u = await findOne('users', { id: ownerId, status: 'active' }, { projection: { name: 1 } }, conn);
     if (!u) throw badRequest('Choose an active agent.');
     await repo.update(c.id, { owner_id: ownerId }, conn);
     await activity.add('change', c.id, user.id, `Assigned to ${u.name}`, 'system', conn);
@@ -221,7 +222,7 @@ export async function transition(number, body, user) {
       const cf = await repo.conflictsFor(c.id, conn);
       if (cf.length && !body.force) { conflict = cf.map((x) => x.change_number); throw unprocessable(`This change overlaps with ${conflict.join(', ')} on a shared asset. Start anyway?`, 'SCHEDULE_CONFLICT', { conflicts: conflict }); }
       if (!(await taskRepo.countByParent('change', c.id, conn))) {
-        const owner = await queryOne('SELECT primary_team_id FROM agents WHERE user_id = ?', [c.owner_id], conn);
+        const owner = await findOne('agents', { user_id: c.owner_id }, { projection: { primary_team_id: 1 } }, conn);
         await createChangeTasks(conn, c, owner?.primary_team_id || null, user.id);
       }
       note = 'State changed to Doing. Change tasks created.';
@@ -250,13 +251,13 @@ export async function decide(number, approvalId, { decision, comment }, user) {
     if (!a || a.change_id !== c.id) throw notFound('Approval not found.');
     if (a.status !== 'Pending') throw unprocessable('This approval has already been decided.');
     if (a.approver_id !== user.id && !user.can('approval:override')) {
-      const who = await queryOne('SELECT name FROM users WHERE id = ?', [a.approver_id], conn);
+      const who = await findOne('users', { id: a.approver_id }, { projection: { name: 1 } }, conn);
       throw forbidden(`Only ${who?.name || 'the approver'} or an admin can decide this approval.`);
     }
     if (!user.can('change:approve') && !user.can('approval:override')) throw forbidden();
     const status = decision === 'approve' ? 'Approved' : 'Rejected';
     await approvalRepo.decide(a.id, status, user.id, comment, conn);
-    const who = await queryOne('SELECT name FROM users WHERE id = ?', [a.approver_id], conn);
+    const who = await findOne('users', { id: a.approver_id }, { projection: { name: 1 } }, conn);
     await activity.add('change', c.id, user.id, `${who?.name} (${a.approver_role}) ${status.toLowerCase()} the change${a.approver_id !== user.id ? ` (decided by ${user.name})` : ''}${comment ? ': ' + comment : ''}`, 'system', conn);
     await audit.log({ action: `${status} change`, entityType: 'change', entityId: c.id, entityRef: number, newValues: { approver: who?.name, role: a.approver_role, decision: status, comment } }, conn);
 

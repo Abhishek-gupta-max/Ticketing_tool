@@ -5,7 +5,7 @@ Commands run from the repository root unless noted. The project is an npm worksp
 ## Requirements
 
 - Node.js 20 or newer (tested with Node 24)
-- MySQL 8 or MariaDB 10.4+ (tested with MariaDB 10.4.32 from XAMPP)
+- MongoDB 6 or newer (tested with MongoDB 8.2 locally); for production a replica set or MongoDB Atlas, so multi-step operations run in transactions
 - For production: a Linux server with Nginx (or another reverse proxy) and a TLS certificate
 
 ## Environment variables
@@ -25,7 +25,8 @@ Backend variables (all documented in `backend/.env.example`):
 |---|---|
 | `NODE_ENV` | `development`, `test` or `production` |
 | `PORT` | API port (default 5000) |
-| `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | database connection (`DB_NAME=tickenting_tools`) |
+| `MONGODB_URI` | MongoDB connection string, e.g. `mongodb://localhost:27017` or `mongodb+srv://user:password@cluster.mongodb.net` |
+| `MONGODB_DB` | database name (default `Ticketing_tools`) |
 | `DB_CONNECTION_LIMIT` | connection pool size |
 | `JWT_SECRET` | at least 32 random characters; the API refuses to start without it |
 | `JWT_EXPIRES_IN` | session length, e.g. `1d`, `8h` |
@@ -47,7 +48,7 @@ Frontend: `VITE_API_URL`, the API base URL (`http://localhost:5000/api/v1` in de
 npm install                                   # installs backend and frontend
 cp backend/.env.example backend/.env          # then set JWT_SECRET and DB_* values
 cp frontend/.env.example frontend/.env
-npm run db:migrate                            # create / update the schema in tickenting_tools
+npm run db:migrate                            # create collections and indexes in Ticketing_tools
 npm run db:seed                               # reference data + first admin
 npm run db:seed:demo                          # optional: sample workspace for evaluation
 npm run dev                                   # API on :5000 and web app on :5173
@@ -67,7 +68,7 @@ npm run test -w backend       # API integration tests
 npm run test -w frontend      # React component tests
 ```
 
-Backend tests are integration tests: they create `DB_NAME_TEST` (default `tickenting_tools_test`), apply every migration, load the seeds, run against the real database and drop it afterwards. The runner refuses to drop any database whose name does not end in `_test`. They cover sign-in, lockout, CSRF, role checks, customer isolation, ticket creation and numbering under concurrency, routing rules, the state machine and SLA pause, comments, attachments (blocked and spoofed files), request approvals and sequential tasks, problems, changes and CAB decisions, knowledge base votes, asset import, the dashboard and the append-only audit log.
+Backend tests are integration tests: they create `MONGODB_DB_TEST` (default `Ticketing_tools_test`), create the collections and indexes, load the seeds, run against the real database and drop it afterwards. The runner refuses to drop any database whose name does not end in `_test`. They cover sign-in, lockout, CSRF, role checks, customer isolation, ticket creation and numbering under concurrency, routing rules, the state machine and SLA pause, comments, attachments (blocked and spoofed files), request approvals and sequential tasks, problems, changes and CAB decisions, knowledge base votes, asset import, the dashboard and the append-only audit log. They pass on a standalone server and on a replica set (with transactions).
 
 Frontend tests (Vitest + Testing Library, services mocked) cover sign-in, protected routes, the ticket list (server-side search and quick views), ticket details, ticket creation, the markdown sanitiser, SLA labels and client validators.
 
@@ -79,23 +80,17 @@ npm run build                 # frontend/dist (code-split, minified)
 npm run test                  # optional, needs a database
 ```
 
-## Database migration in production
+## Database setup in production
 
-Use an administrative account for migrations and a restricted account for the running API.
-
-```sql
-CREATE DATABASE IF NOT EXISTS tickenting_tools CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER 'servicedesk_app'@'127.0.0.1' IDENTIFIED BY '<strong password>';
-GRANT SELECT, INSERT, UPDATE, DELETE ON tickenting_tools.* TO 'servicedesk_app'@'127.0.0.1';
-```
+Use an administrative user to create the collections and seed, and a restricted user for the running API: `readWrite` on the database, plus (recommended) a custom role that allows only `find` and `insert` on `audit_logs` so the audit log cannot be changed (see [DATABASE.md](DATABASE.md#audit-log)).
 
 ```bash
 cd backend
-NODE_ENV=production DB_USER=<admin user> DB_PASSWORD=<admin password> npm run db:migrate
-NODE_ENV=production DB_USER=<admin user> DB_PASSWORD=<admin password> SEED_ADMIN_PASSWORD='<initial admin password>' npm run db:seed
+NODE_ENV=production MONGODB_URI='<admin connection string>' npm run db:migrate
+NODE_ENV=production MONGODB_URI='<admin connection string>' SEED_ADMIN_PASSWORD='<initial admin password>' npm run db:seed
 ```
 
-Do not run `db:seed:demo` in production (it refuses when `NODE_ENV=production`). Take a backup before every migration.
+Do not run `db:seed:demo` in production (it refuses when `NODE_ENV=production`). To move the data of the former MySQL database, see [DATABASE.md](DATABASE.md#moving-the-data-from-mysql). Take a backup before changing the schema.
 
 ## Backend deployment
 
@@ -106,7 +101,7 @@ Do not run `db:seed:demo` in production (it refuses when `NODE_ENV=production`).
 ```ini
 [Unit]
 Description=Veltrixsecure Service Desk API
-After=network.target mariadb.service
+After=network.target mongod.service
 
 [Service]
 WorkingDirectory=/opt/servicedesk/backend
@@ -141,23 +136,23 @@ To call the backend directly instead, set `VITE_API_BASE_URL` to the backend ori
 
 ### Backend on Vercel
 
-Create a second Vercel project from the same repository with Root Directory `backend`. `backend/vercel.json` routes every request to `backend/api/index.js`, which exports the Express app as a serverless function. The MySQL database must be reachable from the internet (a hosted MySQL such as Aiven, TiDB Cloud, Railway or PlanetScale). XAMPP on your own PC is not reachable from Vercel. Create the schema once from your machine against that database:
+Create a second Vercel project from the same repository with Root Directory `backend`. `backend/vercel.json` routes every request to `backend/api/index.js`, which exports the Express app as a serverless function. The database must be reachable from the internet: MongoDB Atlas (free M0 cluster) works well. A MongoDB on your own PC (`mongodb://localhost:27017`) is not reachable from Vercel. In Atlas, under Network Access, allow `0.0.0.0/0` (Vercel has no fixed addresses) and create a database user. Then create the collections and the first admin once from your machine:
 
 ```bash
 cd backend
-DB_HOST=<host> DB_PORT=<port> DB_USER=<user> DB_PASSWORD=<password> DB_NAME=<name> DB_SSL=true npm run db:migrate
-DB_HOST=... SEED_ADMIN_PASSWORD='<admin password>' npm run db:seed
+MONGODB_URI='mongodb+srv://<user>:<password>@<cluster>.mongodb.net' MONGODB_DB=Ticketing_tools npm run db:migrate
+MONGODB_URI='mongodb+srv://...' MONGODB_DB=Ticketing_tools SEED_ADMIN_PASSWORD='<admin password>' npm run db:seed
 ```
 
-To move existing local data instead, export it with `mysqldump` (see Database backup) and import it into the hosted database.
+To copy your local data instead, run `mongodump` on the local database and `mongorestore` into Atlas (see Database backup).
 
 Environment variables (Settings > Environment Variables, Production):
 
 | Variable | Value |
 |---|---|
 | `NODE_ENV` | `production` |
-| `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | hosted MySQL connection (`MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE` are accepted too) |
-| `DB_SSL` | `true` when the provider requires TLS |
+| `MONGODB_URI` | Atlas connection string (`mongodb+srv://...`) |
+| `MONGODB_DB` | `Ticketing_tools` |
 | `JWT_SECRET` | 48+ random bytes |
 | `COOKIE_SECURE` | `true` |
 | `FRONTEND_URL` | `https://ticketing-tool-frontend-nine.vercel.app` |
@@ -221,9 +216,8 @@ Get a certificate with Let's Encrypt: `sudo certbot --nginx -d servicedesk.examp
 Back up the database and the upload directory together.
 
 ```bash
-# nightly, keeps 14 days
-mysqldump --single-transaction --routines --triggers --hex-blob \
-  -u backup_user -p"$BACKUP_PASSWORD" tickenting_tools | gzip > /backups/servicedesk-$(date +%F).sql.gz
+# nightly, keeps 14 days (mongodump and mongorestore are in the MongoDB Database Tools)
+mongodump --uri="$MONGODB_URI" --db=Ticketing_tools --gzip --archive=/backups/servicedesk-$(date +%F).archive.gz
 tar -czf /backups/servicedesk-uploads-$(date +%F).tar.gz -C /var/lib/servicedesk uploads
 find /backups -name 'servicedesk-*' -mtime +14 -delete
 ```
@@ -231,11 +225,11 @@ find /backups -name 'servicedesk-*' -mtime +14 -delete
 Restore into an empty database:
 
 ```bash
-gunzip -c servicedesk-2026-09-27.sql.gz | mysql -u root -p tickenting_tools
+mongorestore --uri="$MONGODB_URI" --gzip --archive=servicedesk-2026-09-27.archive.gz
 tar -xzf servicedesk-uploads-2026-09-27.tar.gz -C /var/lib/servicedesk
 ```
 
-`--triggers` keeps the append-only protection on `audit_logs`. Test restores regularly.
+MongoDB Atlas also takes automatic backups on paid clusters. Test restores regularly.
 
 ## Logging
 

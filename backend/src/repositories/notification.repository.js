@@ -1,16 +1,15 @@
-import { query, queryOne } from '../config/database.js';
+import { insertIgnore, find, count, updateOne, updateMany } from '../config/database.js';
 
-export const insert = (n, conn) => query(
-  'INSERT IGNORE INTO notifications (user_id, type, severity, title, link, dedupe_key) VALUES (?, ?, ?, ?, ?, ?)',
-  [n.userId, n.type, n.severity || 'info', n.title.slice(0, 255), n.link || null, n.dedupeKey || null],
-  conn,
+export const insert = (n, conn) => insertIgnore('notifications', {
+  user_id: n.userId, type: n.type, severity: n.severity || 'info', title: n.title.slice(0, 255), link: n.link || null, dedupe_key: n.dedupeKey || null,
+}, conn);
+
+export const listForUser = (userId, limit = 20) => find(
+  'notifications',
+  { user_id: userId },
+  { sort: { created_at: -1, id: -1 }, limit, projection: { id: 1, type: 1, severity: 1, title: 1, link: 1, is_read: 1, created_at: 1 } },
 );
 
-export const listForUser = (userId, limit = 20) => query(
-  'SELECT id, type, severity, title, link, is_read, created_at FROM notifications WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?',
-  [userId, limit],
-);
-
-export const unreadCount = async (userId) => (await queryOne('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND is_read = 0', [userId])).n;
-export const markRead = (id, userId) => query('UPDATE notifications SET is_read = 1, read_at = UTC_TIMESTAMP(3) WHERE id = ? AND user_id = ?', [id, userId]);
-export const markAllRead = (userId) => query('UPDATE notifications SET is_read = 1, read_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND is_read = 0', [userId]);
+export const unreadCount = (userId) => count('notifications', { user_id: userId, is_read: 0 });
+export const markRead = (id, userId) => updateOne('notifications', { id, user_id: userId }, { is_read: 1, read_at: new Date() });
+export const markAllRead = (userId) => updateMany('notifications', { user_id: userId, is_read: 0 }, { is_read: 1, read_at: new Date() });

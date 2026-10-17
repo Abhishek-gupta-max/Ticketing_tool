@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { signIn, meta, ADMIN, CUSTOMER } from './helpers.js';
-import { closePool, query, queryOne, withTransaction } from '../src/config/database.js';
+import { closePool, find, findOne, withTransaction } from '../src/config/database.js';
 import { nextNumber } from '../src/services/sequence.service.js';
 
 let s, m, requester, cat;
@@ -27,11 +27,11 @@ describe('ticket creation', () => {
     expect(t.number).toMatch(new RegExp(`^INC-${new Date().getUTCFullYear()}-\\d{4}$`));
     expect(t.status).toBe('New');
     expect(t.priority).toBe(4);
-    const row = await queryOne('SELECT * FROM tickets WHERE ticket_number = ?', [t.number]);
+    const row = await findOne('tickets', { ticket_number: t.number });
     expect(row.channel).toBe('Phone');
-    const acts = await query('SELECT body FROM ticket_activities WHERE ticket_id = ?', [row.id]);
+    const acts = await find('ticket_activities', { ticket_id: row.id });
     expect(acts.map((a) => a.body)).toContain('Ticket created via Phone');
-    const audit = await queryOne("SELECT * FROM audit_logs WHERE entity_ref = ? AND action = 'Created incident'", [t.number]);
+    const audit = await findOne('audit_logs', { entity_ref: t.number, action: 'Created incident' });
     expect(audit).toBeTruthy();
   });
 

@@ -1,131 +1,188 @@
-import { query, queryOne } from '../config/database.js';
-import { orderBy } from '../utils/pagination.js';
-
-export const ASSET_SELECT = `
-  a.id, a.asset_tag, a.name, a.asset_type_id, ty.name AS type_name, ty.icon AS type_icon, ty.is_subscription, ty.is_personal_device,
-  a.criticality, a.status, a.environment, a.customer_id, c.name AS customer_name, c.is_internal AS customer_internal, a.department, a.location,
-  a.serial_number, a.platform, a.purchase_date, a.warranty_end, a.assigned_person_id, ap.name AS assigned_name, ap.job_title AS assigned_title,
-  ap.department AS assigned_dept, a.owner_person_id, op.name AS owner_name, op.job_title AS owner_title, op.department AS owner_dept,
-  a.managed_by, mu.name AS managed_by_name, a.support_team_id, st.name AS support_team_name, a.notes, a.created_at, a.updated_at,
-  (SELECT COUNT(*) FROM tickets k WHERE k.asset_id = a.id AND k.deleted_at IS NULL AND k.status IN ('New','In Progress','On Hold','Awaiting approval')) AS open_tickets`;
-
-export const ASSET_FROM = `
-  FROM assets a
-  JOIN asset_types ty ON ty.id = a.asset_type_id
-  JOIN customers c ON c.id = a.customer_id
-  LEFT JOIN people ap ON ap.id = a.assigned_person_id
-  LEFT JOIN people op ON op.id = a.owner_person_id
-  LEFT JOIN users mu ON mu.id = a.managed_by
-  LEFT JOIN teams st ON st.id = a.support_team_id`;
-
-// "Owner" follows the legacy rule: subscriptions -> owner, personal devices -> user then owner, others -> owner.
-const OWNER_ID = 'CASE WHEN ty.is_subscription = 1 THEN a.owner_person_id WHEN ty.is_personal_device = 1 THEN COALESCE(a.assigned_person_id, a.owner_person_id) ELSE a.owner_person_id END';
-
-function buildWhere(f) {
-  const w = ['a.deleted_at IS NULL'], p = [];
-  if (f.typeId) { w.push('a.asset_type_id = ?'); p.push(f.typeId); }
-  if (f.criticality) { w.push('a.criticality = ?'); p.push(f.criticality); }
-  if (f.status) { w.push('a.status = ?'); p.push(f.status); }
-  if (f.customerId) { w.push('a.customer_id = ?'); p.push(f.customerId); }
-  if (f.teamId) { w.push('a.support_team_id = ?'); p.push(f.teamId); }
-  if (f.ownerId) { w.push('(a.assigned_person_id = ? OR a.owner_person_id = ?)'); p.push(f.ownerId, f.ownerId); }
-  if (f.search) {
-    const s = `%${f.search}%`;
-    w.push('(a.asset_tag LIKE ? OR a.name LIKE ? OR a.serial_number LIKE ? OR a.location LIKE ? OR ap.name LIKE ? OR op.name LIKE ?)');
-    p.push(s, s, s, s, s, s);
-  }
-  return { sql: 'WHERE ' + w.join(' AND '), params: p };
-}
-
-const SORTS = { tag: 'a.id', name: 'a.name', type: 'ty.name', criticality: "FIELD(a.criticality,'Low','Medium','High','Critical')", status: 'a.status', warranty: 'a.warranty_end', updated: 'a.updated_at' };
-
-export async function list(f, { limit, offset }) {
-  const { sql, params } = buildWhere(f);
-  const rows = await query(`SELECT ${ASSET_SELECT} ${ASSET_FROM} ${sql} ORDER BY ${orderBy(f.sortBy, f.sortOrder || 'ASC', SORTS, 'tag')} LIMIT ? OFFSET ?`, [...params, limit, offset]);
-  const total = (await queryOne(`SELECT COUNT(*) AS n ${ASSET_FROM} ${sql}`, params)).n;
-  return { rows, total };
-}
-export async function listAll(f) {
-  const { sql, params } = buildWhere(f);
-  return query(`SELECT ${ASSET_SELECT} ${ASSET_FROM} ${sql} ORDER BY a.id LIMIT 20000`, params);
-}
-
-export const kpis = () => queryOne(
-  `SELECT COUNT(*) AS total, SUM(a.status = 'Retired') AS retired,
-          SUM(a.status <> 'Retired' AND a.criticality = 'Critical') AS critical,
-          SUM(a.status <> 'Retired' AND (${OWNER_ID}) IS NULL) AS without_owner,
-          SUM(a.status <> 'Retired' AND ty.is_subscription = 0 AND a.warranty_end IS NOT NULL AND a.warranty_end < CURDATE() + INTERVAL 90 DAY) AS warranty_expiring,
-          SUM(a.status <> 'Retired' AND EXISTS (SELECT 1 FROM tickets k WHERE k.asset_id = a.id AND k.deleted_at IS NULL AND k.status IN ('New','In Progress','On Hold','Awaiting approval'))) AS with_open
-     FROM assets a JOIN asset_types ty ON ty.id = a.asset_type_id WHERE a.deleted_at IS NULL`,
-);
-
-export const findByTag = (tag, conn) => queryOne(`SELECT ${ASSET_SELECT} ${ASSET_FROM} WHERE a.asset_tag = ? AND a.deleted_at IS NULL`, [tag], conn);
-export const findById = (id, conn) => queryOne(`SELECT ${ASSET_SELECT} ${ASSET_FROM} WHERE a.id = ? AND a.deleted_at IS NULL`, [id], conn);
-export const findByName = (name, conn) => queryOne('SELECT id FROM assets WHERE LOWER(name) = LOWER(?) AND deleted_at IS NULL', [name], conn);
-
-export const options = () => query(
-  `SELECT a.id, a.asset_tag, a.name, ty.name AS type_name, a.status, a.assigned_person_id
-     FROM assets a JOIN asset_types ty ON ty.id = a.asset_type_id WHERE a.deleted_at IS NULL ORDER BY a.name`,
-);
-
-export const owners = () => query(
-  `SELECT DISTINCT p.id, p.name FROM people p
-    WHERE p.id IN (SELECT assigned_person_id FROM assets WHERE deleted_at IS NULL UNION SELECT owner_person_id FROM assets WHERE deleted_at IS NULL)
-    ORDER BY p.name`,
-);
+import { OPEN_STATUSES } from '../constants/workflow.js';
+import {
+  insertOne, insertMany, find, findOne, updateOne, deleteMany, aggregate, mapBy, distinct, like, equalsCi,
+} from '../config/database.js';
+import { DAY } from '../utils/time.js';
 
 const COLS = ['name', 'asset_type_id', 'criticality', 'status', 'environment', 'customer_id', 'department', 'location', 'serial_number', 'platform',
   'purchase_date', 'warranty_end', 'assigned_person_id', 'owner_person_id', 'managed_by', 'support_team_id', 'notes'];
 
-export async function insert(tag, a, userId, conn) {
-  const res = await query(
-    `INSERT INTO assets (asset_tag, ${COLS.join(', ')}, created_by) VALUES (?, ${COLS.map(() => '?').join(', ')}, ?)`,
-    [tag, ...COLS.map((c) => a[c] ?? null), userId || null],
-    conn,
-  );
-  return res.insertId;
+// "Owner" follows the legacy rule: subscriptions -> owner, personal devices -> user then owner, others -> owner.
+const ownerId = (a, ty) => (ty.is_subscription === 1 ? a.owner_person_id
+  : ty.is_personal_device === 1 ? a.assigned_person_id ?? a.owner_person_id : a.owner_person_id);
+
+/** Asset rows with type, customer, people, manager, team and open ticket count (former ASSET_SELECT). */
+async function enrich(assets, conn) {
+  if (!assets.length) return [];
+  const [types, customers, people, users, teams, open] = await Promise.all([
+    mapBy('asset_types', assets.map((a) => a.asset_type_id), { conn }),
+    mapBy('customers', assets.map((a) => a.customer_id), { projection: { name: 1, is_internal: 1 }, conn }),
+    mapBy('people', assets.flatMap((a) => [a.assigned_person_id, a.owner_person_id]), { projection: { name: 1, job_title: 1, department: 1 }, conn }),
+    mapBy('users', assets.map((a) => a.managed_by), { projection: { name: 1 }, conn }),
+    mapBy('teams', assets.map((a) => a.support_team_id), { projection: { name: 1 }, conn }),
+    aggregate('tickets', [
+      { $match: { asset_id: { $in: assets.map((a) => a.id) }, deleted_at: null, status: { $in: OPEN_STATUSES } } },
+      { $group: { _id: '$asset_id', n: { $sum: 1 } } },
+    ], conn),
+  ]);
+  const openBy = new Map(open.map((o) => [o._id, o.n]));
+  return assets
+    .filter((a) => types.has(a.asset_type_id) && customers.has(a.customer_id))
+    .map((a) => {
+      const ty = types.get(a.asset_type_id), c = customers.get(a.customer_id);
+      const ap = people.get(a.assigned_person_id), op = people.get(a.owner_person_id);
+      return {
+        id: a.id, asset_tag: a.asset_tag, name: a.name, asset_type_id: a.asset_type_id, type_name: ty.name, type_icon: ty.icon,
+        is_subscription: ty.is_subscription, is_personal_device: ty.is_personal_device, criticality: a.criticality, status: a.status,
+        environment: a.environment, customer_id: a.customer_id, customer_name: c.name, customer_internal: c.is_internal, department: a.department,
+        location: a.location, serial_number: a.serial_number, platform: a.platform, purchase_date: a.purchase_date, warranty_end: a.warranty_end,
+        assigned_person_id: a.assigned_person_id, assigned_name: ap?.name ?? null, assigned_title: ap?.job_title ?? null, assigned_dept: ap?.department ?? null,
+        owner_person_id: a.owner_person_id, owner_name: op?.name ?? null, owner_title: op?.job_title ?? null, owner_dept: op?.department ?? null,
+        managed_by: a.managed_by, managed_by_name: users.get(a.managed_by)?.name ?? null, support_team_id: a.support_team_id,
+        support_team_name: teams.get(a.support_team_id)?.name ?? null, notes: a.notes, created_at: a.created_at, updated_at: a.updated_at,
+        open_tickets: openBy.get(a.id) || 0,
+      };
+    });
 }
 
-export const update = (id, a, conn) => query(
-  `UPDATE assets SET ${COLS.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`,
-  [...COLS.map((c) => a[c] ?? null), id],
-  conn,
-);
+async function buildFilter(f) {
+  const w = { deleted_at: null };
+  if (f.typeId) w.asset_type_id = f.typeId;
+  if (f.criticality) w.criticality = f.criticality;
+  if (f.status) w.status = f.status;
+  if (f.customerId) w.customer_id = f.customerId;
+  if (f.teamId) w.support_team_id = f.teamId;
+  const and = [];
+  if (f.ownerId) and.push({ $or: [{ assigned_person_id: f.ownerId }, { owner_person_id: f.ownerId }] });
+  if (f.search) {
+    const s = like(f.search);
+    const people = await distinct('people', 'id', { name: s });
+    and.push({ $or: [{ asset_tag: s }, { name: s }, { serial_number: s }, { location: s }, { assigned_person_id: { $in: people } }, { owner_person_id: { $in: people } }] });
+  }
+  if (and.length) w.$and = and;
+  return w;
+}
 
-export const softDelete = (id, conn) => query('UPDATE assets SET deleted_at = UTC_TIMESTAMP(3), name = CONCAT(name, \' (deleted \', id, \')\') WHERE id = ?', [id], conn);
+const CRITICALITY = ['Low', 'Medium', 'High', 'Critical'];
+const cmp = (a, b) => (a == null && b == null ? 0 : a == null ? -1 : b == null ? 1
+  : typeof a === 'string' ? a.localeCompare(b, 'en', { sensitivity: 'base' }) : a < b ? -1 : a > b ? 1 : 0);
+const SORTS = {
+  tag: (r) => r.id, name: (r) => r.name, type: (r) => r.type_name, criticality: (r) => CRITICALITY.indexOf(r.criticality) + 1,
+  status: (r) => r.status, warranty: (r) => r.warranty_end, updated: (r) => r.updated_at,
+};
 
-export const dependsOn = (id) => query(
-  `SELECT a.id, a.asset_tag, a.name, a.criticality FROM asset_dependencies d JOIN assets a ON a.id = d.depends_on_asset_id
-    WHERE d.asset_id = ? AND a.deleted_at IS NULL ORDER BY a.name`,
-  [id],
-);
-export const dependencyIds = async (id) => (await query('SELECT depends_on_asset_id AS id FROM asset_dependencies WHERE asset_id = ?', [id])).map((r) => r.id);
+export async function list(f, { limit, offset }) {
+  const rows = await enrich(await find('assets', await buildFilter(f)));
+  const key = SORTS[f.sortBy] || SORTS.tag;
+  const dir = String(f.sortOrder || 'ASC').toUpperCase() === 'ASC' ? 1 : -1;
+  rows.sort((a, b) => dir * cmp(key(a), key(b)));
+  return { rows: rows.slice(offset, offset + limit), total: rows.length };
+}
+
+export async function listAll(f) {
+  return enrich(await find('assets', await buildFilter(f), { sort: { id: 1 }, limit: 20000 }));
+}
+
+export async function kpis() {
+  const assets = await find('assets', { deleted_at: null });
+  const types = await mapBy('asset_types', assets.map((a) => a.asset_type_id));
+  const withType = assets.filter((a) => types.has(a.asset_type_id));
+  const open = new Set(await distinct('tickets', 'asset_id', { asset_id: { $ne: null }, deleted_at: null, status: { $in: OPEN_STATUSES } }));
+  const live = withType.filter((a) => a.status !== 'Retired');
+  const today = new Date(new Date().toISOString().slice(0, 10));
+  return {
+    total: withType.length,
+    retired: withType.length - live.length,
+    critical: live.filter((a) => a.criticality === 'Critical').length,
+    without_owner: live.filter((a) => ownerId(a, types.get(a.asset_type_id)) == null).length,
+    warranty_expiring: live.filter((a) => types.get(a.asset_type_id).is_subscription === 0 && a.warranty_end != null
+      && a.warranty_end < new Date(today.getTime() + 90 * DAY)).length,
+    with_open: live.filter((a) => open.has(a.id)).length,
+  };
+}
+
+const one = async (filter, conn) => (await enrich(await find('assets', filter, {}, conn), conn))[0] || null;
+export const findByTag = (tag, conn) => one({ asset_tag: tag, deleted_at: null }, conn);
+export const findById = (id, conn) => one({ id, deleted_at: null }, conn);
+export const findByName = (name, conn) => findOne('assets', { name: equalsCi(name), deleted_at: null }, { projection: { id: 1 } }, conn);
+
+export async function options() {
+  const rows = await find('assets', { deleted_at: null }, { sort: { name: 1 }, projection: { id: 1, asset_tag: 1, name: 1, asset_type_id: 1, status: 1, assigned_person_id: 1 } });
+  const types = await mapBy('asset_types', rows.map((a) => a.asset_type_id), { projection: { name: 1 } });
+  return rows.filter((a) => types.has(a.asset_type_id)).map((a) => ({
+    id: a.id, asset_tag: a.asset_tag, name: a.name, type_name: types.get(a.asset_type_id).name, status: a.status, assigned_person_id: a.assigned_person_id,
+  }));
+}
+
+export async function owners() {
+  const ids = [
+    ...await distinct('assets', 'assigned_person_id', { deleted_at: null }),
+    ...await distinct('assets', 'owner_person_id', { deleted_at: null }),
+  ].filter((x) => x != null);
+  return find('people', { id: { $in: [...new Set(ids)] } }, { sort: { name: 1 }, projection: { id: 1, name: 1 } });
+}
+
+export const insert = (tag, a, userId, conn) => insertOne('assets', {
+  asset_tag: tag,
+  ...Object.fromEntries(COLS.map((c) => [c, a[c] ?? null]).filter(([, v]) => v !== null)),
+  created_by: userId || null,
+}, conn);
+
+export const update = (id, a, conn) => updateOne('assets', { id }, Object.fromEntries(COLS.map((c) => [c, a[c] ?? null])), conn);
+
+export async function softDelete(id, conn) {
+  const a = await findOne('assets', { id }, { projection: { name: 1 } }, conn);
+  return updateOne('assets', { id }, { deleted_at: new Date(), name: `${a?.name} (deleted ${id})` }, conn);
+}
+
+export async function dependsOn(id) {
+  const ids = await distinct('asset_dependencies', 'depends_on_asset_id', { asset_id: id });
+  return find('assets', { id: { $in: ids }, deleted_at: null }, { sort: { name: 1 }, projection: { id: 1, asset_tag: 1, name: 1, criticality: 1 } });
+}
+export const dependencyIds = (id) => distinct('asset_dependencies', 'depends_on_asset_id', { asset_id: id });
 
 export async function setDependencies(id, ids, conn) {
-  await query('DELETE FROM asset_dependencies WHERE asset_id = ?', [id], conn);
+  await deleteMany('asset_dependencies', { asset_id: id }, conn);
   const clean = [...new Set(ids)].filter((x) => x !== id);
-  if (clean.length) await query('INSERT INTO asset_dependencies (asset_id, depends_on_asset_id) VALUES ?', [clean.map((d) => [id, d])], conn);
+  await insertMany('asset_dependencies', clean.map((d) => ({ asset_id: id, depends_on_asset_id: d })), conn);
 }
 
-/** Everything that depends on this asset, directly or indirectly. */
-export const dependents = (id) => query(
-  `WITH RECURSIVE dep (id, depth) AS (
-     SELECT asset_id, 1 FROM asset_dependencies WHERE depends_on_asset_id = ?
-     UNION
-     SELECT d.asset_id, dep.depth + 1 FROM asset_dependencies d JOIN dep ON d.depends_on_asset_id = dep.id WHERE dep.depth < 10
-   )
-   SELECT a.id, a.asset_tag, a.name, MIN(dep.depth) AS depth, ${OWNER_ID} AS owner_id, COALESCE(ap.name, op.name) AS owner_name
-     FROM dep JOIN assets a ON a.id = dep.id JOIN asset_types ty ON ty.id = a.asset_type_id
-     LEFT JOIN people ap ON ap.id = a.assigned_person_id LEFT JOIN people op ON op.id = a.owner_person_id
-    WHERE a.deleted_at IS NULL AND a.id <> ?
-    GROUP BY a.id ORDER BY a.name`,
-  [id, id],
-);
+/** Everything that depends on this asset, directly or indirectly (up to 10 levels). */
+export async function dependents(id) {
+  const edges = await find('asset_dependencies', {});
+  const depth = new Map();
+  let frontier = [id];
+  for (let level = 1; level <= 10 && frontier.length; level++) {
+    const next = [];
+    for (const target of frontier) {
+      for (const e of edges) {
+        if (e.depends_on_asset_id === target && !depth.has(e.asset_id)) { depth.set(e.asset_id, level); next.push(e.asset_id); }
+      }
+    }
+    frontier = next;
+  }
+  depth.delete(id);
+  const assets = await find('assets', { id: { $in: [...depth.keys()] }, deleted_at: null }, {
+    projection: { id: 1, asset_tag: 1, name: 1, asset_type_id: 1, assigned_person_id: 1, owner_person_id: 1 },
+  });
+  const [types, people] = await Promise.all([
+    mapBy('asset_types', assets.map((a) => a.asset_type_id)),
+    mapBy('people', assets.flatMap((a) => [a.assigned_person_id, a.owner_person_id]), { projection: { name: 1 } }),
+  ]);
+  return assets
+    .filter((a) => types.has(a.asset_type_id))
+    .map((a) => ({
+      id: a.id, asset_tag: a.asset_tag, name: a.name, depth: depth.get(a.id), owner_id: ownerId(a, types.get(a.asset_type_id)) ?? null,
+      owner_name: people.get(a.assigned_person_id)?.name ?? people.get(a.owner_person_id)?.name ?? null,
+    }))
+    .sort((a, b) => cmp(a.name, b.name));
+}
 
-export const assignedToPerson = (personId) => query('SELECT id, asset_tag, name FROM assets WHERE assigned_person_id = ? AND deleted_at IS NULL', [personId]);
+export const assignedToPerson = (personId) => find('assets', { assigned_person_id: personId, deleted_at: null }, { projection: { id: 1, asset_tag: 1, name: 1 } });
 
-export const changesForAsset = (id) => query(
-  `SELECT ch.id, ch.change_number, ch.title, ch.status, ch.close_code, ch.planned_start FROM change_assets ca JOIN changes ch ON ch.id = ca.change_id
-    WHERE ca.asset_id = ? AND ch.deleted_at IS NULL ORDER BY ch.planned_start DESC`,
-  [id],
-);
+export async function changesForAsset(id) {
+  const ids = await distinct('change_assets', 'change_id', { asset_id: id });
+  return find('changes', { id: { $in: ids }, deleted_at: null }, {
+    sort: { planned_start: -1 }, projection: { id: 1, change_number: 1, title: 1, status: 1, close_code: 1, planned_start: 1 },
+  });
+}

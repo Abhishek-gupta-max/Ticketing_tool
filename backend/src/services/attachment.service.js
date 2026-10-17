@@ -5,7 +5,7 @@ import { writeUpload, removeUpload, uploadPath } from '../utils/fileStorage.js';
 import { badRequest, forbidden, notFound } from '../utils/AppError.js';
 import { env } from '../config/env.js';
 import { attachment as mapAttachment } from '../models/mappers.js';
-import { queryOne } from '../config/database.js';
+import { findOne } from '../config/database.js';
 
 // Same blocked list as the original application, plus a few more script types.
 export const BLOCKED_EXT = ['exe', 'bat', 'cmd', 'msi', 'scr', 'vbs', 'js', 'jar', 'com', 'ps1', 'dll', 'hta', 'lnk', 'reg', 'vbe', 'wsf', 'cpl', 'msp', 'sh', 'php'];
@@ -89,7 +89,7 @@ export async function authorize(id, user) {
   const a = await repo.findById(id);
   if (!a) throw notFound('Attachment not found.');
   if (a.entity_type === 'ticket') {
-    const t = await queryOne('SELECT requester_id FROM tickets WHERE id = ? AND deleted_at IS NULL', [a.entity_id]);
+    const t = await findOne('tickets', { id: a.entity_id, deleted_at: null }, { projection: { requester_id: 1 } });
     if (!t) throw notFound('Attachment not found.');
     const staff = user.can('ticket:view_all');
     if (!staff && t.requester_id !== user.personId) throw notFound('Attachment not found.');

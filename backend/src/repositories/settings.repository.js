@@ -1,47 +1,50 @@
-import { query, queryOne } from '../config/database.js';
+import { insertOne, find, findOne, updateOne, deleteMany, attach, collection } from '../config/database.js';
 
+// Setting values are stored as JSON text, as before.
 export async function getSetting(key, conn) {
-  const row = await queryOne('SELECT value FROM settings WHERE setting_key = ?', [key], conn);
+  const row = await findOne('settings', { setting_key: key }, { projection: { value: 1 } }, conn);
   return row ? JSON.parse(row.value) : null;
 }
 
-export const setSetting = (key, value, userId, conn) => query(
-  'INSERT INTO settings (setting_key, value, updated_by) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value), updated_by = VALUES(updated_by)',
-  [key, JSON.stringify(value), userId || null],
-  conn,
+export const setSetting = (key, value, userId, conn) => collection('settings').updateOne(
+  { setting_key: key },
+  { $set: { value: JSON.stringify(value), updated_by: userId || null, updated_at: new Date() }, $setOnInsert: { setting_key: key } },
+  { upsert: true, ...(conn?.session && { session: conn.session }) },
 );
 
 export async function allSettings() {
-  const rows = await query('SELECT setting_key, value FROM settings');
+  const rows = await find('settings', {}, { projection: { setting_key: 1, value: 1 } });
   return Object.fromEntries(rows.map((r) => [r.setting_key, JSON.parse(r.value)]));
 }
 
-export const priorities = (conn) => query('SELECT id, name, response_minutes, resolution_minutes FROM priorities ORDER BY id', [], conn);
-export const updatePriority = (id, resp, res, conn) => query('UPDATE priorities SET response_minutes = ?, resolution_minutes = ? WHERE id = ?', [resp, res, id], conn);
+export const priorities = (conn) => find('priorities', {}, { sort: { id: 1 }, projection: { id: 1, name: 1, response_minutes: 1, resolution_minutes: 1 } }, conn);
+export const updatePriority = (id, resp, res, conn) => updateOne('priorities', { id }, { response_minutes: resp, resolution_minutes: res }, conn);
 
-export const categories = (conn) => query(
-  `SELECT c.id, c.name, c.default_team_id, t.name AS team_name, t.code AS team_code, t.is_active AS team_active, c.is_active
-     FROM ticket_categories c LEFT JOIN teams t ON t.id = c.default_team_id ORDER BY c.sort_order, c.id`,
-  [],
-  conn,
-);
-export const categoryById = (id, conn) => queryOne('SELECT * FROM ticket_categories WHERE id = ?', [id], conn);
-export const categoryByName = (name, conn) => queryOne('SELECT * FROM ticket_categories WHERE name = ?', [name], conn);
-export const setCategoryTeam = (id, teamId, conn) => query('UPDATE ticket_categories SET default_team_id = ? WHERE id = ?', [teamId, id], conn);
-
-export const lookups = () => query('SELECT list_key, value FROM lookup_values WHERE is_active = 1 ORDER BY list_key, sort_order, value');
-export const lookupExists = async (listKey, value, conn) => !!(await queryOne('SELECT 1 AS x FROM lookup_values WHERE list_key = ? AND value = ? AND is_active = 1', [listKey, value], conn));
-
-export const rules = (conn) => query('SELECT id, code, name, description, is_enabled FROM automation_rules ORDER BY sort_order, id', [], conn);
-export const setRule = (code, enabled) => query('UPDATE automation_rules SET is_enabled = ? WHERE code = ?', [enabled ? 1 : 0, code]);
-
-export const canned = () => query('SELECT id, name, body FROM canned_responses ORDER BY sort_order, name');
-export async function createCanned(name, body) {
-  const res = await query('INSERT INTO canned_responses (name, body, sort_order) SELECT ?, ?, COALESCE(MAX(sort_order), 0) + 1 FROM canned_responses', [name, body]);
-  return res.insertId;
+export async function categories(conn) {
+  const rows = await find('ticket_categories', {}, { sort: { sort_order: 1, id: 1 }, projection: { id: 1, name: 1, default_team_id: 1, is_active: 1 } }, conn);
+  return attach(rows, 'teams', 'default_team_id', { team_name: 'name', team_code: 'code', team_active: 'is_active' }, { conn });
 }
-export const updateCanned = (id, name, body) => query('UPDATE canned_responses SET name = ?, body = ? WHERE id = ?', [name, body, id]);
-export const deleteCanned = (id) => query('DELETE FROM canned_responses WHERE id = ?', [id]);
+export const categoryById = (id, conn) => findOne('ticket_categories', { id }, {}, conn);
+export const categoryByName = (name, conn) => findOne('ticket_categories', { name }, {}, conn);
+export const setCategoryTeam = (id, teamId, conn) => updateOne('ticket_categories', { id }, { default_team_id: teamId }, conn);
 
-export const assetTypes = () => query('SELECT id, name, icon, is_subscription, is_personal_device FROM asset_types ORDER BY sort_order, name');
-export const kbCategories = () => query('SELECT id, name FROM knowledge_categories ORDER BY sort_order, name');
+export const lookups = () => find('lookup_values', { is_active: 1 }, { sort: { list_key: 1, sort_order: 1, value: 1 }, projection: { list_key: 1, value: 1 } });
+export const lookupExists = async (listKey, value, conn) => !!(await findOne('lookup_values', { list_key: listKey, value, is_active: 1 }, { projection: { id: 1 } }, conn));
+
+export const rules = (conn) => find('automation_rules', {}, {
+  sort: { sort_order: 1, id: 1 }, projection: { id: 1, code: 1, name: 1, description: 1, is_enabled: 1 },
+}, conn);
+export const setRule = (code, enabled) => updateOne('automation_rules', { code }, { is_enabled: enabled ? 1 : 0 });
+
+export const canned = () => find('canned_responses', {}, { sort: { sort_order: 1, name: 1 }, projection: { id: 1, name: 1, body: 1 } });
+export async function createCanned(name, body) {
+  const last = await findOne('canned_responses', {}, { sort: { sort_order: -1 }, projection: { sort_order: 1 } });
+  return insertOne('canned_responses', { name, body, sort_order: (last?.sort_order || 0) + 1 });
+}
+export const updateCanned = (id, name, body) => updateOne('canned_responses', { id }, { name, body });
+export const deleteCanned = (id) => deleteMany('canned_responses', { id });
+
+export const assetTypes = () => find('asset_types', {}, {
+  sort: { sort_order: 1, name: 1 }, projection: { id: 1, name: 1, icon: 1, is_subscription: 1, is_personal_device: 1 },
+});
+export const kbCategories = () => find('knowledge_categories', {}, { sort: { sort_order: 1, name: 1 }, projection: { id: 1, name: 1 } });

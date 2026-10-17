@@ -1,6 +1,6 @@
 // Ticket queries and lifecycle. Business rules are ported from the original
 // single-file application (createTicket, setStatus, assignTicket, postReply...).
-import { withTransaction, queryOne } from '../config/database.js';
+import { withTransaction, findOne } from '../config/database.js';
 import * as repo from '../repositories/ticket.repository.js';
 import * as teamRepo from '../repositories/team.repository.js';
 import * as customerRepo from '../repositories/customer.repository.js';
@@ -63,7 +63,7 @@ export async function activity(conn, ticketId, userId, text) {
 
 async function userName(id, conn) {
   if (!id) return 'Unassigned';
-  return (await queryOne('SELECT name FROM users WHERE id = ?', [id], conn))?.name || 'Unknown';
+  return (await findOne('users', { id }, { projection: { name: 1 } }, conn))?.name || 'Unknown';
 }
 
 // ---------------------------------------------------------------- queries
@@ -220,7 +220,7 @@ export async function createInConnection(conn, o, user) {
   let assignee = null;
   if (o.assignee === 'auto') assignee = await teamRepo.leastBusyMember(teamId, conn);
   else if (o.assignee) {
-    const u = await queryOne("SELECT u.id FROM users u JOIN agents a ON a.user_id = u.id WHERE u.id = ? AND u.status = 'active'", [o.assignee], conn);
+    const u = (await findOne('agents', { user_id: o.assignee }, {}, conn)) ? await findOne('users', { id: o.assignee, status: 'active' }, { projection: { id: 1 } }, conn) : null;
     if (!u) throw badRequest('Choose an active agent.', 'INVALID_ASSIGNEE');
     assignee = u.id;
   }
@@ -426,7 +426,7 @@ export async function assignInConnection(conn, t, assigneeId, user) {
   const f = { assigned_to: assigneeId || null };
   const changes = { assigned_to: [t.assigned_to, assigneeId || null] };
   if (assigneeId) {
-    const agent = await queryOne("SELECT u.id, u.name, a.primary_team_id FROM users u JOIN agents a ON a.user_id = u.id WHERE u.id = ? AND u.status = 'active'", [assigneeId], conn);
+    const agent = await activeAgent(assigneeId, conn);
     if (!agent) throw badRequest('Choose an active agent.', 'INVALID_ASSIGNEE');
     if (t.status === 'New') { f.status = 'In Progress'; changes.status = ['New', 'In Progress']; }
     if (t.team_id && !(await teamRepo.isMember(t.team_id, assigneeId, conn)) && agent.primary_team_id) {
@@ -748,4 +748,11 @@ export async function createProblemFromTicket(number, body, user) {
 export async function similarCount(number, user) {
   const t = await getVisible(number, user);
   return (await repo.similarWithoutProblem(t.title, t.id)).length;
+}
+
+/** An active staff user with their primary team, or null. */
+async function activeAgent(userId, conn) {
+  const a = await findOne('agents', { user_id: userId }, { projection: { primary_team_id: 1 } }, conn);
+  const u = a ? await findOne('users', { id: userId, status: 'active' }, { projection: { id: 1, name: 1 } }, conn) : null;
+  return u ? { id: u.id, name: u.name, primary_team_id: a.primary_team_id } : null;
 }

@@ -27,16 +27,17 @@ import settingsRoutes from './settings.routes.js';
 
 const r = Router();
 
-const DB_REASONS = {
-  ECONNREFUSED: 'Connection refused: nothing is listening on DB_HOST:DB_PORT (localhost is not reachable from a hosting service).',
-  ENOTFOUND: 'DB_HOST was not found. Check the host name.',
-  EAI_AGAIN: 'DB_HOST could not be resolved. Check the host name.',
-  ETIMEDOUT: 'Connection timed out. Check DB_HOST, DB_PORT and that the database accepts connections from the internet.',
-  ER_ACCESS_DENIED_ERROR: 'The database rejected DB_USER / DB_PASSWORD.',
-  ER_BAD_DB_ERROR: 'DB_NAME does not exist on the server.',
-  HANDSHAKE_SSL_ERROR: 'TLS failed. Check DB_SSL.',
-};
-const dbReason = (err) => DB_REASONS[err?.code] || (err?.code ? `Database error ${err.code}` : 'Unknown database error');
+// Why the database cannot be reached: the driver's error type only, never the
+// connection string or credentials.
+function dbReason(err) {
+  const text = String(err?.message || '');
+  if (err?.code === 18 || /auth/i.test(text)) return 'MongoDB rejected the user name or password in MONGODB_URI.';
+  if (/ENOTFOUND|EAI_AGAIN|querySrv/i.test(text)) return 'The host in MONGODB_URI was not found. Check the connection string.';
+  if (/ECONNREFUSED/i.test(text)) return 'Connection refused: nothing is listening at MONGODB_URI (localhost is not reachable from a hosting service).';
+  if (err?.name === 'MongoServerSelectionError') return 'MongoDB did not answer. Check MONGODB_URI and that the database allows connections from this server (Atlas: Network Access).';
+  if (err?.name === 'MongoParseError') return 'MONGODB_URI is not a valid MongoDB connection string.';
+  return err?.name ? `Database error ${err.name}` : 'Unknown database error';
+}
 
 // ---------- public ----------
 r.get('/health', async (req, res) => {

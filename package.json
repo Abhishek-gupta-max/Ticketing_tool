@@ -2,7 +2,7 @@
   "name": "ticketing-tools",
   "version": "1.0.0",
   "private": true,
-  "description": "Veltrixsecure Service Desk: React + Node.js + MySQL",
+  "description": "Veltrixsecure Service Desk: React + Node.js + MongoDB",
   "workspaces": [
     "backend",
     "frontend"
@@ -16,7 +16,7 @@
     "db:seed": "npm run db:seed -w backend",
     "db:seed:demo": "npm run db:seed:demo -w backend",
     "db:status": "npm run db:status -w backend",
-    "db:schema": "npm run db:schema -w backend"
+    "db:import-mysql": "npm run db:import-mysql -w backend"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"

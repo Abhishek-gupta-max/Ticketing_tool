@@ -1,100 +1,135 @@
-import { query, queryOne } from '../config/database.js';
+import {
+  insertOne, insertMany, insertIgnore, find, findOne, updateOne, deleteMany, distinct, attach, like, collection,
+} from '../config/database.js';
 
-const SELECT = `k.id, k.article_number, k.title, k.category_id, kc.name AS category_name, k.audience, k.status, k.body, k.view_count,
-  k.helpful_count, k.not_helpful_count, k.author_id, u.name AS author_name, k.published_at, k.created_at, k.updated_at,
-  (SELECT GROUP_CONCAT(tag ORDER BY tag SEPARATOR ',') FROM knowledge_article_tags t WHERE t.article_id = k.id) AS tags`;
-const FROM = 'FROM knowledge_articles k JOIN knowledge_categories kc ON kc.id = k.category_id LEFT JOIN users u ON u.id = k.author_id';
+const FIELDS = {
+  id: 1, article_number: 1, title: 1, category_id: 1, audience: 1, status: 1, body: 1, view_count: 1, helpful_count: 1, not_helpful_count: 1,
+  author_id: 1, published_at: 1, created_at: 1, updated_at: 1,
+};
 
-export function list({ search, categoryId, audience, status, internal }) {
-  const w = ['k.deleted_at IS NULL'], p = [];
-  if (!internal) { w.push("k.audience = 'Public' AND k.status = 'Published'"); }
-  if (status && status !== 'all') { w.push('k.status = ?'); p.push(status); }
-  if (categoryId) { w.push('k.category_id = ?'); p.push(categoryId); }
-  if (audience) { w.push('k.audience = ?'); p.push(audience); }
-  if (search) {
-    const s = `%${search}%`;
-    w.push('(k.title LIKE ? OR k.body LIKE ? OR EXISTS (SELECT 1 FROM knowledge_article_tags t WHERE t.article_id = k.id AND t.tag LIKE ?))');
-    p.push(s, s, s);
+const byTag = (a, b) => (a.toLowerCase() < b.toLowerCase() ? -1 : a.toLowerCase() > b.toLowerCase() ? 1 : 0);
+
+/** Category, author and comma-separated tags (former JOINs and GROUP_CONCAT). */
+async function enrich(rows, conn) {
+  const list = Array.isArray(rows) ? rows : [rows].filter(Boolean);
+  if (!list.length) return rows;
+  await attach(list, 'knowledge_categories', 'category_id', { category_name: 'name' }, { conn });
+  await attach(list, 'users', 'author_id', { author_name: 'name' }, { conn });
+  const tags = await find('knowledge_article_tags', { article_id: { $in: list.map((k) => k.id) } }, {}, conn);
+  for (const k of list) {
+    const mine = tags.filter((t) => t.article_id === k.id).map((t) => t.tag).sort(byTag);
+    k.tags = mine.length ? mine.join(',') : null;
   }
-  return query(`SELECT ${SELECT} ${FROM} WHERE ${w.join(' AND ')} ORDER BY k.view_count DESC, k.id DESC LIMIT 500`, p);
+  return Array.isArray(rows) ? list.filter((k) => k.category_name != null) : (list[0]?.category_name != null ? rows : null);
 }
 
-export const kpis = () => queryOne(
-  `SELECT SUM(status = 'Published') AS published, SUM(status = 'Draft') AS drafts, COUNT(*) AS total, SUM(view_count) AS views,
-          SUM(helpful_count) AS helpful, SUM(not_helpful_count) AS not_helpful, SUM(status = 'Published' AND audience = 'Internal') AS internal
-     FROM knowledge_articles WHERE deleted_at IS NULL`,
-);
-
-export const findByNumber = (n, conn) => queryOne(`SELECT ${SELECT} ${FROM} WHERE k.article_number = ? AND k.deleted_at IS NULL`, [n], conn);
-export const findById = (id, conn) => queryOne(`SELECT ${SELECT} ${FROM} WHERE k.id = ? AND k.deleted_at IS NULL`, [id], conn);
-
-export async function insert(a, conn) {
-  const res = await query(
-    `INSERT INTO knowledge_articles (article_number, title, category_id, audience, status, body, author_id, published_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ${a.status === 'Published' ? 'UTC_TIMESTAMP(3)' : 'NULL'})`,
-    [a.number, a.title, a.categoryId, a.audience, a.status, a.body, a.authorId],
-    conn,
-  );
-  return res.insertId;
+export async function list({ search, categoryId, audience, status, internal }) {
+  const w = { deleted_at: null };
+  const and = [];
+  if (!internal) { w.audience = 'Public'; w.status = 'Published'; }
+  if (status && status !== 'all') and.push({ status });
+  if (categoryId) w.category_id = categoryId;
+  if (audience) and.push({ audience });
+  if (search) {
+    const tagged = await distinct('knowledge_article_tags', 'article_id', { tag: like(search) });
+    and.push({ $or: [{ title: like(search) }, { body: like(search) }, { id: { $in: tagged } }] });
+  }
+  if (and.length) w.$and = and;
+  return enrich(await find('knowledge_articles', w, { sort: { view_count: -1, id: -1 }, limit: 500, projection: FIELDS }));
 }
 
-export const update = (id, a, conn) => query(
-  `UPDATE knowledge_articles SET title = ?, category_id = ?, audience = ?, status = ?, body = ?,
-          published_at = CASE WHEN ? = 'Published' THEN COALESCE(published_at, UTC_TIMESTAMP(3)) ELSE published_at END
-    WHERE id = ?`,
-  [a.title, a.categoryId, a.audience, a.status, a.body, a.status, id],
-  conn,
-);
+export async function kpis() {
+  const rows = await find('knowledge_articles', { deleted_at: null }, {
+    projection: { status: 1, audience: 1, view_count: 1, helpful_count: 1, not_helpful_count: 1 },
+  });
+  const sum = (f) => rows.reduce((s, r) => s + (f(r) || 0), 0);
+  return {
+    published: sum((r) => r.status === 'Published'),
+    drafts: sum((r) => r.status === 'Draft'),
+    total: rows.length,
+    views: sum((r) => r.view_count),
+    helpful: sum((r) => r.helpful_count),
+    not_helpful: sum((r) => r.not_helpful_count),
+    internal: sum((r) => r.status === 'Published' && r.audience === 'Internal'),
+  };
+}
 
-export const setStatus = (id, status, conn) => query(
-  `UPDATE knowledge_articles SET status = ?, published_at = CASE WHEN ? = 'Published' THEN UTC_TIMESTAMP(3) ELSE published_at END WHERE id = ?`,
-  [status, status, id],
-  conn,
-);
+export const findByNumber = async (n, conn) => enrich(await findOne('knowledge_articles', { article_number: n, deleted_at: null }, { projection: FIELDS }, conn), conn);
+export const findById = async (id, conn) => enrich(await findOne('knowledge_articles', { id, deleted_at: null }, { projection: FIELDS }, conn), conn);
 
-export const softDelete = (id, conn) => query('UPDATE knowledge_articles SET deleted_at = UTC_TIMESTAMP(3) WHERE id = ?', [id], conn);
+export const insert = (a, conn) => insertOne('knowledge_articles', {
+  article_number: a.number, title: a.title, category_id: a.categoryId, audience: a.audience, status: a.status, body: a.body, author_id: a.authorId,
+  published_at: a.status === 'Published' ? new Date() : null,
+}, conn);
+
+export async function update(id, a, conn) {
+  const current = await findOne('knowledge_articles', { id }, { projection: { published_at: 1 } }, conn);
+  const fields = { title: a.title, category_id: a.categoryId, audience: a.audience, status: a.status, body: a.body };
+  if (a.status === 'Published' && !current?.published_at) fields.published_at = new Date();
+  return updateOne('knowledge_articles', { id }, fields, conn);
+}
+
+export const setStatus = (id, status, conn) => updateOne('knowledge_articles', { id }, { status, ...(status === 'Published' && { published_at: new Date() }) }, conn);
+
+export const softDelete = (id, conn) => updateOne('knowledge_articles', { id }, { deleted_at: new Date() }, conn);
 
 export async function setTags(id, tags, conn) {
-  await query('DELETE FROM knowledge_article_tags WHERE article_id = ?', [id], conn);
-  if (tags.length) await query('INSERT INTO knowledge_article_tags (article_id, tag) VALUES ?', [tags.map((t) => [id, t])], conn);
+  await deleteMany('knowledge_article_tags', { article_id: id }, conn);
+  await insertMany('knowledge_article_tags', tags.map((t) => ({ article_id: id, tag: t })), conn);
 }
+
+const utcDate = () => new Date(new Date().toISOString().slice(0, 10));
 
 /** Count a view once per user per day. */
 export async function recordView(id, userId) {
-  const res = await query('INSERT IGNORE INTO knowledge_article_views (article_id, user_id, view_date) VALUES (?, ?, UTC_DATE())', [id, userId]);
-  if (res.affectedRows) await query('UPDATE knowledge_articles SET view_count = view_count + 1 WHERE id = ?', [id]);
+  if (await insertIgnore('knowledge_article_views', { article_id: id, user_id: userId, view_date: utcDate() })) {
+    await collection('knowledge_articles').updateOne({ id }, { $inc: { view_count: 1 } });
+  }
 }
 
 /** One vote per user; changing the vote moves it between the counters. */
 export async function vote(id, userId, helpful, conn) {
-  const prev = await queryOne('SELECT is_helpful FROM knowledge_article_votes WHERE article_id = ? AND user_id = ? FOR UPDATE', [id, userId], conn);
+  const prev = await findOne('knowledge_article_votes', { article_id: id, user_id: userId }, { projection: { is_helpful: 1 } }, conn);
   if (prev && !!prev.is_helpful === helpful) return;
-  await query('INSERT INTO knowledge_article_votes (article_id, user_id, is_helpful) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE is_helpful = VALUES(is_helpful), voted_at = UTC_TIMESTAMP(3)', [id, userId, helpful ? 1 : 0], conn);
+  const s = conn?.session ? { session: conn.session } : {};
+  await collection('knowledge_article_votes').updateOne(
+    { article_id: id, user_id: userId },
+    { $set: { is_helpful: helpful ? 1 : 0, voted_at: new Date() } },
+    { upsert: true, ...s },
+  );
   const col = helpful ? 'helpful_count' : 'not_helpful_count';
   const other = helpful ? 'not_helpful_count' : 'helpful_count';
-  await query(`UPDATE knowledge_articles SET ${col} = ${col} + 1${prev ? `, ${other} = GREATEST(${other} - 1, 0)` : ''} WHERE id = ?`, [id], conn);
+  if (!prev) {
+    await collection('knowledge_articles').updateOne({ id }, { $inc: { [col]: 1 } }, s);
+  } else {
+    await collection('knowledge_articles').updateOne({ id }, [
+      { $set: { [col]: { $add: [`$${col}`, 1] }, [other]: { $max: [{ $subtract: [`$${other}`, 1] }, 0] } } },
+    ], s);
+  }
 }
 
 export const myVote = async (id, userId) => {
-  const r = await queryOne('SELECT is_helpful FROM knowledge_article_votes WHERE article_id = ? AND user_id = ?', [id, userId]);
+  const r = await findOne('knowledge_article_votes', { article_id: id, user_id: userId }, { projection: { is_helpful: 1 } });
   return r ? !!r.is_helpful : null;
 };
 
-export const publishedForMatching = () => query(
-  `SELECT k.id, k.article_number, k.title, kc.name AS category_name,
-          (SELECT GROUP_CONCAT(tag SEPARATOR ' ') FROM knowledge_article_tags t WHERE t.article_id = k.id) AS tags
-     FROM knowledge_articles k JOIN knowledge_categories kc ON kc.id = k.category_id WHERE k.status = 'Published' AND k.deleted_at IS NULL`,
-);
+export async function publishedForMatching() {
+  const rows = await find('knowledge_articles', { status: 'Published', deleted_at: null }, { projection: { id: 1, article_number: 1, title: 1, category_id: 1 } });
+  await attach(rows, 'knowledge_categories', 'category_id', { category_name: 'name' });
+  const tags = await find('knowledge_article_tags', { article_id: { $in: rows.map((r) => r.id) } });
+  return rows.filter((r) => r.category_name != null).map((r) => {
+    const mine = tags.filter((t) => t.article_id === r.id).map((t) => t.tag);
+    return { id: r.id, article_number: r.article_number, title: r.title, category_name: r.category_name, tags: mine.length ? mine.join(' ') : null };
+  });
+}
 
-export const related = (id, categoryId, internal) => query(
-  `SELECT DISTINCT k.id, k.article_number, k.title FROM knowledge_articles k
-    WHERE k.id <> ? AND k.status = 'Published' AND k.deleted_at IS NULL ${internal ? '' : "AND k.audience = 'Public'"}
-      AND (k.category_id = ? OR EXISTS (SELECT 1 FROM knowledge_article_tags a JOIN knowledge_article_tags b ON b.tag = a.tag
-            WHERE a.article_id = k.id AND b.article_id = ?))
-    LIMIT 4`,
-  [id, categoryId, id],
-);
+export async function related(id, categoryId, internal) {
+  const myTags = await distinct('knowledge_article_tags', 'tag', { article_id: id });
+  const sharing = myTags.length ? await distinct('knowledge_article_tags', 'article_id', { tag: { $in: myTags } }) : [];
+  return find('knowledge_articles', {
+    id: { $ne: id }, status: 'Published', deleted_at: null, ...(internal ? {} : { audience: 'Public' }),
+    $or: [{ category_id: categoryId }, { id: { $in: sharing } }],
+  }, { limit: 4, projection: { id: 1, article_number: 1, title: 1 } });
+}
 
-export const referencedIn = async (number) => (await queryOne(
-  'SELECT COUNT(DISTINCT ticket_id) AS n FROM ticket_comments WHERE body LIKE ?', [`%${number}%`],
-)).n;
+export const referencedIn = async (number) => (await distinct('ticket_comments', 'ticket_id', { body: like(number) })).length;

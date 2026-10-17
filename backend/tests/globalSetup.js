@@ -1,4 +1,4 @@
-// Builds a fresh test database from the migrations and seeds, so tests run
+// Builds a fresh test database (collections, indexes and seeds), so tests run
 // against the real schema. Only databases whose name ends in _test are touched.
 export default async function setup() {
   process.env.NODE_ENV = 'test';
@@ -7,8 +7,10 @@ export default async function setup() {
   const { env } = await import('../src/config/env.js');
   const { dropDatabase, migrateUp } = await import('../src/utils/migrator.js');
   const { runSeeds } = await import('../src/utils/seeder.js');
+  const { closePool } = await import('../src/config/database.js');
   await dropDatabase(env.dbName);
   await migrateUp({ dbName: env.dbName });
-  await runSeeds('demo', { dbName: env.dbName });
-  return async () => { await dropDatabase(env.dbName); };
+  await runSeeds('demo');
+  await closePool();
+  return async () => { await dropDatabase(env.dbName); await closePool(); };
 }

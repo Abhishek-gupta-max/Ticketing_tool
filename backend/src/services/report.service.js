@@ -2,7 +2,8 @@ import * as stats from '../repositories/stats.repository.js';
 import * as approvalRepo from '../repositories/approval.repository.js';
 import * as settings from './settings.service.js';
 import * as audit from './audit.service.js';
-import { query, queryOne } from '../config/database.js';
+import { find, count, insertOne, deleteMany, mapBy } from '../config/database.js';
+import { isMet } from '../utils/sla.js';
 import { tzOffset, startOfDayUtc, DAY } from '../utils/time.js';
 import { notFound } from '../utils/AppError.js';
 
@@ -61,7 +62,7 @@ export async function processReport({ tab = 'incident', range = 30, customerId, 
   if (tab === 'incident' || tab === 'request') {
     const w = await stats.kindWindow(from, to, f, tab);
     if (tab === 'incident') {
-      const groups = await stats.groupedTitles(from, to, f, "t.kind = 'incident'");
+      const groups = await stats.groupedTitles(from, to, f, { kind: 'incident' });
       return {
         mini: [['Incidents created', n(w.created), 'in this period'], ['Mean time to resolve', w.mttr != null ? `${Number(w.mttr).toFixed(1)} h` : '-', 'resolved incidents'], ['Reopened', n(w.resolved) ? `${((n(w.reopened) / n(w.resolved)) * 100).toFixed(1)}%` : '-', 'of resolved incidents']],
         title: 'Most frequent incidents', head: ['Incident', 'Count', 'Resolve time', 'SLA'],
@@ -77,8 +78,12 @@ export async function processReport({ tab = 'incident', range = 30, customerId, 
     };
   }
   if (tab === 'problem') {
-    const k = await queryOne("SELECT SUM(status IN ('Logged','Investigating','Finding cause','Fix underway')) AS open_count, SUM(status IN ('Logged','Investigating','Finding cause','Fix underway') AND is_known_error = 1) AS known FROM problems WHERE deleted_at IS NULL");
-    const linked = await queryOne('SELECT COUNT(*) AS n FROM tickets WHERE problem_id IS NOT NULL AND deleted_at IS NULL');
+    const OPEN = ['Logged', 'Investigating', 'Finding cause', 'Fix underway'];
+    const k = {
+      open_count: await count('problems', { deleted_at: null, status: { $in: OPEN } }),
+      known: await count('problems', { deleted_at: null, status: { $in: OPEN }, is_known_error: 1 }),
+    };
+    const linked = { n: await count('tickets', { problem_id: { $ne: null }, deleted_at: null }) };
     const rows = await stats.problemRows();
     return {
       mini: [['Open problems', n(k.open_count), 'not yet resolved'], ['Known errors', n(k.known), 'workaround available'], ['Incidents linked', n(linked.n), 'across all problems']],
@@ -87,7 +92,12 @@ export async function processReport({ tab = 'incident', range = 30, customerId, 
     };
   }
   if (tab === 'change') {
-    const k = await queryOne("SELECT SUM(status = 'Closed' AND close_code IS NOT NULL) AS done, SUM(status = 'Closed' AND close_code IS NOT NULL AND close_code <> 'Did not work') AS ok, SUM(type = 'Emergency') AS emergency, SUM(status = 'Approval') AS awaiting FROM changes WHERE deleted_at IS NULL");
+    const k = {
+      done: await count('changes', { deleted_at: null, status: 'Closed', close_code: { $ne: null } }),
+      ok: await count('changes', { deleted_at: null, status: 'Closed', close_code: { $nin: [null, 'Did not work'] } }),
+      emergency: await count('changes', { deleted_at: null, type: 'Emergency' }),
+      awaiting: await count('changes', { deleted_at: null, status: 'Approval' }),
+    };
     const rows = await stats.changeStatusRows();
     return {
       mini: [['Success rate', n(k.done) ? `${((n(k.ok) / n(k.done)) * 100).toFixed(0)}%` : '-', `${n(k.done)} finished changes`], ['Emergency changes', n(k.emergency), 'all time'], ['Awaiting approval', n(k.awaiting), 'CAB decision needed']],
@@ -95,7 +105,8 @@ export async function processReport({ tab = 'incident', range = 30, customerId, 
     };
   }
   const sec = await stats.security(from, to, f);
-  const groups = await stats.groupedTitles(from, to, f, "t.category_id = (SELECT id FROM ticket_categories WHERE name = 'Security alerts')");
+  const securityId = await stats.securityCategoryId();
+  const groups = securityId == null ? [] : await stats.groupedTitles(from, to, f, { category_id: securityId });
   const frts = groups.filter((g) => g.frt != null).map((g) => Number(g.frt));
   return {
     mini: [['Security tickets', n(sec.created), 'created in this period'], ['Average first response', frts.length ? `${Math.round(frts.reduce((a, b) => a + b, 0) / frts.length)}m` : '-', 'security tickets'], ['Open critical and high', n(sec.open_high), 'right now']],
@@ -106,31 +117,40 @@ export async function processReport({ tab = 'incident', range = 30, customerId, 
 
 export async function exportTickets({ range = 30, customerId, teamId }) {
   const { from } = await dailySeries(range, {});
-  const w = ['t.deleted_at IS NULL', 't.created_at >= ?'], p = [from];
-  if (customerId) { w.push('t.customer_id = ?'); p.push(customerId); }
-  if (teamId) { w.push('t.team_id = ?'); p.push(teamId); }
-  return query(
-    `SELECT t.ticket_number, t.kind, t.title, c.name AS customer, cat.name AS category, pr.name AS priority, t.status, u.name AS owner,
-            t.created_at, t.resolved_at, TIMESTAMPDIFF(MINUTE, t.created_at, t.first_response_at) AS frt,
-            CASE WHEN t.resolved_at IS NULL THEN '' WHEN t.resolved_at <= TIMESTAMPADD(SECOND, t.paused_seconds, t.sla_resolution_due_at) THEN 'Met' ELSE 'Missed' END AS sla, t.csat
-       FROM tickets t JOIN customers c ON c.id = t.customer_id JOIN ticket_categories cat ON cat.id = t.category_id JOIN priorities pr ON pr.id = t.priority
-       LEFT JOIN users u ON u.id = t.assigned_to WHERE ${w.join(' AND ')} ORDER BY t.created_at DESC LIMIT 50000`,
-    p,
-  );
+  const w = { deleted_at: null, created_at: { $gte: from } };
+  if (customerId) w.customer_id = customerId;
+  if (teamId) w.team_id = teamId;
+  const rows = await find('tickets', w, { sort: { created_at: -1 }, limit: 50000 });
+  const [customers, categories, priorities, users] = await Promise.all([
+    mapBy('customers', rows.map((t) => t.customer_id), { projection: { name: 1 } }),
+    mapBy('ticket_categories', rows.map((t) => t.category_id), { projection: { name: 1 } }),
+    mapBy('priorities', rows.map((t) => t.priority), { projection: { name: 1 } }),
+    mapBy('users', rows.map((t) => t.assigned_to), { projection: { name: 1 } }),
+  ]);
+  return rows
+    .filter((t) => customers.has(t.customer_id) && categories.has(t.category_id) && priorities.has(t.priority))
+    .map((t) => ({
+      ticket_number: t.ticket_number, kind: t.kind, title: t.title, customer: customers.get(t.customer_id).name, category: categories.get(t.category_id).name,
+      priority: priorities.get(t.priority).name, status: t.status, owner: users.get(t.assigned_to)?.name ?? null, created_at: t.created_at,
+      resolved_at: t.resolved_at,
+      // TIMESTAMPDIFF(MINUTE, ...): whole minutes
+      frt: t.first_response_at ? Math.trunc((t.first_response_at - t.created_at) / 60000) : null,
+      sla: t.resolved_at == null ? '' : isMet(t) ? 'Met' : 'Missed',
+      csat: t.csat,
+    }));
 }
 
 // ---------- schedules ----------
-export const schedules = async () => (await query('SELECT id, name, frequency, format, recipient, run_when FROM report_schedules ORDER BY id')).map((s) => ({ id: s.id, name: s.name, frequency: s.frequency, format: s.format, recipient: s.recipient, when: s.run_when }));
+export const schedules = async () => (await find('report_schedules', {}, { sort: { id: 1 } })).map((s) => ({ id: s.id, name: s.name, frequency: s.frequency, format: s.format, recipient: s.recipient, when: s.run_when }));
 
 export async function addSchedule(b, user) {
-  const res = await query('INSERT INTO report_schedules (name, frequency, format, recipient, run_when, created_by) VALUES (?, ?, ?, ?, ?, ?)', [b.name, b.frequency, b.format, b.recipient, b.when, user.id]);
-  await audit.log({ action: 'Scheduled report', entityType: 'report', entityId: res.insertId, entityRef: 'Reports', newValues: b });
+  const id = await insertOne('report_schedules', { name: b.name, frequency: b.frequency, format: b.format, recipient: b.recipient, run_when: b.when, created_by: user.id });
+  await audit.log({ action: 'Scheduled report', entityType: 'report', entityId: id, entityRef: 'Reports', newValues: b });
   return schedules();
 }
 
 export async function removeSchedule(id) {
-  const res = await query('DELETE FROM report_schedules WHERE id = ?', [id]);
-  if (!res.affectedRows) throw notFound('Schedule not found.');
+  if (!(await deleteMany('report_schedules', { id }))) throw notFound('Schedule not found.');
   await audit.log({ action: 'Removed scheduled report', entityType: 'report', entityId: id, entityRef: 'Reports' });
   return schedules();
 }

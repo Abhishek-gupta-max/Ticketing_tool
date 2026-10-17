@@ -1,4 +1,4 @@
-import { withTransaction, queryOne, query } from '../config/database.js';
+import { withTransaction, find, findOne } from '../config/database.js';
 import * as repo from '../repositories/majorIncident.repository.js';
 import * as ticketRepo from '../repositories/ticket.repository.js';
 import * as teamRepo from '../repositories/team.repository.js';
@@ -8,7 +8,8 @@ import * as notifications from './notification.service.js';
 import { setImpactUrgencyInConnection } from './ticket.service.js';
 import { nextMajorNumber } from './sequence.service.js';
 import * as map from '../models/mappers.js';
-import { SQL_OPEN, SQL_BREACHED } from '../utils/sla.js';
+import { isOpen, isBreached } from '../utils/sla.js';
+import { DAY } from '../utils/time.js';
 import { badRequest, notFound, unprocessable } from '../utils/AppError.js';
 import { OPEN_STATUSES } from '../constants/workflow.js';
 
@@ -20,16 +21,21 @@ const shape = (m) => (m ? {
 /** Incidents page: KPIs, matrix, on-call list, incident room and past major incidents. */
 export async function overview() {
   const active = await repo.active();
-  const k = await queryOne(
-    `SELECT SUM(${SQL_OPEN}) AS open_count, SUM(${SQL_OPEN} AND t.assigned_to IS NULL) AS unassigned,
-            SUM(${SQL_OPEN} AND t.priority <= 2) AS high, SUM(${SQL_BREACHED}) AS breached,
-            AVG(CASE WHEN t.resolved_at > UTC_TIMESTAMP(3) - INTERVAL 30 DAY THEN (TIMESTAMPDIFF(SECOND, t.created_at, t.resolved_at) - t.paused_seconds) / 3600 END) AS mttr
-       FROM tickets t JOIN priorities pr ON pr.id = t.priority WHERE t.kind = 'incident' AND t.deleted_at IS NULL`,
-  );
-  const matrix = await query(
-    `SELECT impact, urgency, COUNT(*) AS n FROM tickets t WHERE t.kind = 'incident' AND t.deleted_at IS NULL AND ${SQL_OPEN} GROUP BY impact, urgency`,
-  );
-  const grid = [1, 2, 3].map((i) => [1, 2, 3].map((u) => Number(matrix.find((m) => m.impact === i && m.urgency === u)?.n || 0)));
+  const priorities = new Set((await find('priorities', {}, { projection: { id: 1 } })).map((p) => p.id));
+  const incidents = (await find('tickets', { kind: 'incident', deleted_at: null })).filter((t) => priorities.has(t.priority));
+  const open = incidents.filter(isOpen);
+  const monthAgo = new Date(Date.now() - 30 * DAY);
+  // (TIMESTAMPDIFF(SECOND, created, resolved) - paused_seconds) / 3600
+  const hours = incidents.filter((t) => t.resolved_at != null && t.resolved_at > monthAgo)
+    .map((t) => (Math.trunc((t.resolved_at - t.created_at) / 1000) - (t.paused_seconds || 0)) / 3600);
+  const k = {
+    open_count: open.length,
+    unassigned: open.filter((t) => t.assigned_to == null).length,
+    high: open.filter((t) => t.priority <= 2).length,
+    breached: incidents.filter((t) => isBreached(t)).length,
+    mttr: hours.length ? hours.reduce((a, b) => a + b, 0) / hours.length : null,
+  };
+  const grid = [1, 2, 3].map((i) => [1, 2, 3].map((u) => open.filter((t) => t.impact === i && t.urgency === u).length));
   let room = null;
   if (active) {
     const t = await ticketRepo.findById(active.ticket_id);
@@ -58,7 +64,7 @@ export async function declare({ ticketNumber, impact, commanderId }, user) {
     if (!t) throw badRequest('Choose an incident.');
     await ticketRepo.lockById(t.id, conn);
     if (t.kind !== 'incident' || !OPEN_STATUSES.includes(t.status) || t.is_major) throw unprocessable('Only an open incident that is not already major can be declared.');
-    const cmd = await queryOne("SELECT id, name FROM users WHERE id = ? AND status = 'active'", [commanderId], conn);
+    const cmd = await findOne('users', { id: commanderId, status: 'active' }, { projection: { id: 1, name: 1 } }, conn);
     if (!cmd) throw badRequest('Choose an incident commander.');
     const mi = await nextMajorNumber(conn);
     const id = await repo.insert({ number: mi, ticketId: t.id, title: t.title, commanderId: cmd.id, impact }, conn);

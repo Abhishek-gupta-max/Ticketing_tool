@@ -72,17 +72,14 @@ const CUSTOMERS = [
   { code: 'c-in', name: 'Veltrixsecure internal', plan: 'Internal', bias: -0.04, internal: true },
 ];
 
-async function insertRows(conn, table, rows, chunk = 300) {
-  if (!rows.length) return;
-  const cols = Object.keys(rows[0]);
-  for (let i = 0; i < rows.length; i += chunk) {
-    const part = rows.slice(i, i + chunk);
-    await conn.query(`INSERT INTO ${table} (${cols.map((c) => '`' + c + '`').join(',')}) VALUES ?`, [part.map((r) => cols.map((c) => r[c] ?? null))]);
-  }
+async function insertRows(db, table, rows, chunk = 300) {
+  const ids = [];
+  for (let i = 0; i < rows.length; i += chunk) ids.push(...await db.insertMany(table, rows.slice(i, i + chunk)));
+  return ids;
 }
 
-export default async function seed({ conn, log, hashPassword, env, randomPassword, writeUpload }) {
-  const [[{ n: existing }]] = await conn.query('SELECT COUNT(*) AS n FROM tickets');
+export default async function seed({ db, log, hashPassword, env, randomPassword, writeUpload }) {
+  const existing = await db.count('tickets');
   if (existing) { log(`skipped: ${existing} tickets already exist`); return; }
 
   const R = rng(20260919), now = Date.now(), YR = new Date().getFullYear();
@@ -92,44 +89,43 @@ export default async function seed({ conn, log, hashPassword, env, randomPasswor
   const d = (ms) => new Date(ms);
 
   // ---------- lookups ----------
-  const [teamRows] = await conn.query('SELECT id, code FROM teams');
+  const teamRows = await db.find('teams', {});
   const TEAM = Object.fromEntries(teamRows.map((t) => [t.code, t.id]));
-  const [catRows] = await conn.query('SELECT id, name FROM ticket_categories');
+  const catRows = await db.find('ticket_categories', {});
   const CAT = Object.fromEntries(catRows.map((c) => [c.name, c.id]));
-  const [kbCatRows] = await conn.query('SELECT id, name FROM knowledge_categories');
+  const kbCatRows = await db.find('knowledge_categories', {});
   const KBCAT = Object.fromEntries(kbCatRows.map((c) => [c.name, c.id]));
-  const [typeRows] = await conn.query('SELECT id, name FROM asset_types');
+  const typeRows = await db.find('asset_types', {});
   const ATYPE = Object.fromEntries(typeRows.map((c) => [c.name, c.id]));
-  const [ciRows] = await conn.query('SELECT id, code FROM catalog_items');
+  const ciRows = await db.find('catalog_items', {});
   const CI = Object.fromEntries(ciRows.map((c) => [c.code, c.id]));
-  const [ctRows] = await conn.query('SELECT catalog_item_id, title, sort_order FROM catalog_tasks ORDER BY catalog_item_id, sort_order');
+  const ctRows = await db.find('catalog_tasks', {}, { sort: { catalog_item_id: 1, sort_order: 1 } });
   const CI_TASKS = {};
   ctRows.forEach((r) => { (CI_TASKS[r.catalog_item_id] = CI_TASKS[r.catalog_item_id] || []).push(r.title); });
-  const [roleRows] = await conn.query('SELECT id, name FROM roles');
+  const roleRows = await db.find('roles', {});
   const ROLE = Object.fromEntries(roleRows.map((r) => [r.name, r.id]));
 
   // ---------- agents ----------
   const demoPassword = env.SEED_DEMO_PASSWORD || randomPassword();
   const demoHash = await hashPassword(demoPassword);
-  const [[admin]] = await conn.query("SELECT u.id FROM users u JOIN roles r ON r.id = u.role_id WHERE r.name = 'Admin' ORDER BY u.id LIMIT 1");
+  const admin = await db.findOne('users', { role_id: ROLE.Admin }, { sort: { id: 1 } });
   const U = { a0: admin.id };
   const agentTeams = { a0: ['sd'] };
   for (const a of AGENTS) {
-    const [[found]] = await conn.query('SELECT id FROM users WHERE email = ?', [a.email]);
+    const found = await db.findOne('users', { email: a.email });
     let id = found?.id;
     if (!id) {
-      const [res] = await conn.query('INSERT INTO users (role_id, name, email, password_hash, password_changed_at) VALUES (?, ?, ?, ?, UTC_TIMESTAMP(3))', [ROLE[a.role], a.name, a.email, demoHash]);
-      id = res.insertId;
-      await conn.query('INSERT INTO agents (user_id, primary_team_id) VALUES (?, ?)', [id, TEAM[a.teams[0]]]);
-      for (const t of a.teams) await conn.query('INSERT IGNORE INTO team_members (team_id, user_id) VALUES (?, ?)', [TEAM[t], id]);
+      id = await db.insertOne('users', { role_id: ROLE[a.role], name: a.name, email: a.email, password_hash: demoHash, password_changed_at: new Date() });
+      await db.insertOne('agents', { user_id: id, primary_team_id: TEAM[a.teams[0]] });
+      for (const t of a.teams) await db.insertIgnore('team_members', { team_id: TEAM[t], user_id: id });
     }
     U[a.key] = id; agentTeams[a.key] = a.teams;
   }
   const managers = { sd: 'a3', soc: 'a4', infra: 'a6', apps: 'a8', cab: 'a3' };
-  for (const [code, key] of Object.entries(managers)) await conn.query('UPDATE teams SET manager_id = ? WHERE code = ?', [U[key], code]);
-  await conn.query('UPDATE team_members SET is_on_call = 1 WHERE (team_id = ? AND user_id = ?) OR (team_id = ? AND user_id = ?)', [TEAM.soc, U.a4, TEAM.infra, U.a6]);
-  await conn.query("UPDATE settings SET value = ? WHERE setting_key = 'cab_approvers'", [JSON.stringify([
-    { userId: U.a3, role: 'Change manager' }, { userId: U.a4, role: 'Security lead' }, { userId: U.a8, role: 'Service owner' }])]);
+  for (const [code, key] of Object.entries(managers)) await db.updateOne('teams', { code }, { manager_id: U[key] });
+  await db.updateMany('team_members', { $or: [{ team_id: TEAM.soc, user_id: U.a4 }, { team_id: TEAM.infra, user_id: U.a6 }] }, { is_on_call: 1 });
+  await db.updateOne('settings', { setting_key: 'cab_approvers' }, { value: JSON.stringify([
+    { userId: U.a3, role: 'Change manager' }, { userId: U.a4, role: 'Security lead' }, { userId: U.a8, role: 'Service owner' }]) });
   const nameOf = { a0: 'Service Desk Admin', ...Object.fromEntries(AGENTS.map((a) => [a.key, a.name])) };
   const agentsOf = (tm) => Object.keys(agentTeams).filter((k) => agentTeams[k].includes(tm));
   log(`agents (demo password ${env.SEED_DEMO_PASSWORD ? 'from SEED_DEMO_PASSWORD' : 'generated: ' + demoPassword})`);
@@ -137,8 +133,8 @@ export default async function seed({ conn, log, hashPassword, env, randomPasswor
   // ---------- customers and people ----------
   const CUST = {};
   for (const c of CUSTOMERS) {
-    await conn.query('INSERT IGNORE INTO customers (code, name, plan, is_internal) VALUES (?, ?, ?, ?)', [c.code, c.name, c.plan, c.internal ? 1 : 0]);
-    const [[row]] = await conn.query('SELECT id FROM customers WHERE code = ?', [c.code]);
+    await db.insertIgnore('customers', { code: c.code, name: c.name, plan: c.plan, is_internal: c.internal ? 1 : 0 });
+    const row = await db.findOne('customers', { code: c.code });
     CUST[c.code] = row.id;
   }
   const people = [];
@@ -151,18 +147,18 @@ export default async function seed({ conn, log, hashPassword, env, randomPasswor
       let email = nm.toLowerCase().replace(/\s+/g, '.') + '@' + c.name.toLowerCase().replace(/[^a-z]/g, '') + '.example';
       while (usedEmails.has(email)) email = email.replace('@', pn + '@');
       usedEmails.add(email);
-      const [res] = await conn.query(
-        'INSERT INTO people (customer_id, name, email, is_vip, department, job_title, location, phone) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [CUST[c.code], nm, email, i === 0 ? 1 : 0, DEPTS[pn % 5], TITLES[(pn * 3) % 5], LOCS[(pn * 2) % 5], '+91 20 555 ' + String(1000 + pn * 7)],
-      );
-      people.push({ id: res.insertId, cust: c.code, name: nm, email });
+      const id = await db.insertOne('people', {
+        customer_id: CUST[c.code], name: nm, email, is_vip: i === 0 ? 1 : 0, department: DEPTS[pn % 5], job_title: TITLES[(pn * 3) % 5],
+        location: LOCS[(pn * 2) % 5], phone: '+91 20 555 ' + String(1000 + pn * 7),
+      });
+      people.push({ id, cust: c.code, name: nm, email });
     }
   }
   const P = (cu, i) => people.filter((p) => p.cust === cu)[i].id;
   // A customer portal login for the first Kestrel Bank requester.
   const portal = people.find((p) => p.cust === 'c-nw');
-  const [portalUser] = await conn.query('INSERT INTO users (role_id, name, email, password_hash, password_changed_at) VALUES (?, ?, ?, ?, UTC_TIMESTAMP(3))', [ROLE.Customer, portal.name, portal.email, demoHash]);
-  await conn.query('UPDATE people SET user_id = ? WHERE id = ?', [portalUser.insertId, portal.id]);
+  const portalUserId = await db.insertOne('users', { role_id: ROLE.Customer, name: portal.name, email: portal.email, password_hash: demoHash, password_changed_at: new Date() });
+  await db.updateOne('people', { id: portal.id }, { user_id: portalUserId });
   log(`customers and ${people.length} requesters (portal login: ${portal.email})`);
 
   // ---------- assets ----------
@@ -224,14 +220,13 @@ export default async function seed({ conn, log, hashPassword, env, randomPasswor
   let an = 0;
   for (const a of assets) {
     a.tag = 'AST-' + String(++an).padStart(3, '0');
-    const [res] = await conn.query(
-      `INSERT INTO assets (asset_tag, name, asset_type_id, criticality, status, environment, customer_id, location, serial_number, platform, warranty_end,
-        assigned_person_id, owner_person_id, managed_by, support_team_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [a.tag, a.name, ATYPE[a.type], a.crit, a.status, a.env, CUST[a.cu], a.loc, a.ident, a.os, a.warranty, a.user || null, a.owner || null, a.mgr ? U[a.mgr] : null, a.grp ? TEAM[a.grp] : null, U.a0],
-    );
-    a.id = res.insertId;
+    a.id = await db.insertOne('assets', {
+      asset_tag: a.tag, name: a.name, asset_type_id: ATYPE[a.type], criticality: a.crit, status: a.status, environment: a.env, customer_id: CUST[a.cu],
+      location: a.loc, serial_number: a.ident, platform: a.os, warranty_end: a.warranty, assigned_person_id: a.user || null, owner_person_id: a.owner || null,
+      managed_by: a.mgr ? U[a.mgr] : null, support_team_id: a.grp ? TEAM[a.grp] : null, created_by: U.a0,
+    });
   }
-  for (const [name, list] of Object.entries(deps)) for (const dn of list) await conn.query('INSERT INTO asset_dependencies (asset_id, depends_on_asset_id) VALUES (?, ?)', [A(name).id, A(dn).id]);
+  for (const [name, list] of Object.entries(deps)) for (const dn of list) await db.insertOne('asset_dependencies', { asset_id: A(name).id, depends_on_asset_id: A(dn).id });
   log(`${assets.length} assets`);
 
   // ---------- tickets ----------
@@ -359,8 +354,9 @@ export default async function seed({ conn, log, hashPassword, env, randomPasswor
     r.items.push(t); t.request = r; t.line = r.items.length; t.number = r.number + '.' + t.line;
   }
   for (const r of requests) {
-    const [res] = await conn.query('INSERT INTO requests (request_number, requested_for_id, customer_id, opened_by, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?)', [r.number, r.requestedFor, CUST[r.cust], d(r.createdAt), d(r.createdAt)]);
-    r.id = res.insertId;
+    r.id = await db.insertOne('requests', {
+      request_number: r.number, requested_for_id: r.requestedFor, customer_id: CUST[r.cust], opened_by: null, created_at: d(r.createdAt), updated_at: d(r.createdAt),
+    });
   }
 
   // ---------- problems (needed before ticket insert for the FK) ----------
@@ -376,14 +372,14 @@ export default async function seed({ conn, log, hashPassword, env, randomPasswor
   const PRB = {};
   for (const [n, title, status, pri, owner, rc, wa, days, known] of problems) {
     const fixed = status === 'Fixed';
-    const [res] = await conn.query(
-      `INSERT INTO problems (problem_number, title, status, priority, owner_id, root_cause, workaround, is_known_error, resolution_code, fix_notes, resolved_at, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [num('PRB', n), title, status, pri, U[owner], rc, wa, known ? 1 : 0, fixed ? 'Fixed permanently' : null, fixed ? 'Capacity added to the backup target.' : null, fixed ? d(T(28)) : null, U[owner], d(T(days)), d(T(Math.max(0, days - 3)))],
-    );
-    PRB[n] = res.insertId;
-    await conn.query('INSERT INTO problem_activities (problem_id, type, body, created_at) VALUES (?, ?, ?, ?)', [res.insertId, 'system', 'Problem record created', d(T(days))]);
-    if (fixed) await conn.query('INSERT INTO problem_activities (problem_id, type, body, created_at) VALUES (?, ?, ?, ?)', [res.insertId, 'system', 'Resolved (Fixed permanently). Capacity added to the backup target.', d(T(28))]);
+    const id = await db.insertOne('problems', {
+      problem_number: num('PRB', n), title, status, priority: pri, owner_id: U[owner], root_cause: rc, workaround: wa, is_known_error: known ? 1 : 0,
+      resolution_code: fixed ? 'Fixed permanently' : null, fix_notes: fixed ? 'Capacity added to the backup target.' : null, resolved_at: fixed ? d(T(28)) : null,
+      created_by: U[owner], created_at: d(T(days)), updated_at: d(T(Math.max(0, days - 3))),
+    });
+    PRB[n] = id;
+    await db.insertOne('problem_activities', { problem_id: id, type: 'system', body: 'Problem record created', created_at: d(T(days)) });
+    if (fixed) await db.insertOne('problem_activities', { problem_id: id, type: 'system', body: 'Resolved (Fixed permanently). Capacity added to the backup target.', created_at: d(T(28)) });
   }
 
   // Major incident prep (activities appended before insert)
@@ -392,7 +388,7 @@ export default async function seed({ conn, log, hashPassword, env, randomPasswor
   sys(openMajor, openMajor.createdAt + 15 * MIN, 'Declared as a major incident (MI-1)');
 
   const lastAt = (t) => Math.max(t.createdAt, ...t.acts.map((a) => a.at), ...t.comments.map((c) => c.at));
-  await insertRows(conn, 'tickets', list.map((t) => ({
+  const ticketIds = await insertRows(db, 'tickets', list.map((t) => ({
     ticket_number: t.number, kind: t.kind, title: t.title, description: t.desc, customer_id: CUST[t.cust], requester_id: t.requester, category_id: CAT[t.cat],
     team_id: TEAM[t.team], assigned_to: t.assignee ? U[t.assignee] : null, channel: t.channel, impact: t.impact, urgency: t.urgency, priority: t.priority, status: t.status,
     hold_reason: t.holdReason, is_major: t.major ? 1 : 0, sla_response_due_at: d(t.slaResp), sla_resolution_due_at: d(t.slaRes), paused_at: t.pausedAt ? d(t.pausedAt) : null, paused_seconds: 0,
@@ -401,14 +397,12 @@ export default async function seed({ conn, log, hashPassword, env, randomPasswor
     request_id: t.request ? t.request.id : null, catalog_item_id: t.catalogCode ? CI[t.catalogCode] : null, created_by: null,
     created_at: d(t.createdAt), updated_at: d(lastAt(t)),
   })));
-  const [idRows] = await conn.query('SELECT id, ticket_number FROM tickets');
-  const TID = Object.fromEntries(idRows.map((r) => [r.ticket_number, r.id]));
-  list.forEach((t) => { t.id = TID[t.number]; });
+  list.forEach((t, i) => { t.id = ticketIds[i]; });
 
-  await insertRows(conn, 'ticket_activities', list.flatMap((t) => t.acts.map((a) => ({ ticket_id: t.id, user_id: null, body: a.text, created_at: d(a.at) }))));
-  await insertRows(conn, 'ticket_comments', list.flatMap((t) => t.comments.map((c) => ({ ticket_id: t.id, user_id: U[c.by], type: c.type, body: c.text, created_at: d(c.at) }))));
-  await insertRows(conn, 'request_items', list.filter((t) => t.request).map((t) => ({ request_id: t.request.id, ticket_id: t.id, catalog_item_id: CI[t.catalogCode], line_no: t.line, created_at: d(t.createdAt) })));
-  await insertRows(conn, 'approvals', list.filter((t) => t.approval).map((t) => ({
+  await insertRows(db, 'ticket_activities', list.flatMap((t) => t.acts.map((a) => ({ ticket_id: t.id, user_id: null, body: a.text, created_at: d(a.at) }))));
+  await insertRows(db, 'ticket_comments', list.flatMap((t) => t.comments.map((c) => ({ ticket_id: t.id, user_id: U[c.by], type: c.type, body: c.text, created_at: d(c.at) }))));
+  await insertRows(db, 'request_items', list.filter((t) => t.request).map((t) => ({ request_id: t.request.id, ticket_id: t.id, catalog_item_id: CI[t.catalogCode], line_no: t.line, created_at: d(t.createdAt) })));
+  await insertRows(db, 'approvals', list.filter((t) => t.approval).map((t) => ({
     approval_type: 'request', ticket_id: t.id, approver_id: null, approver_role: 'Line manager', status: t.approval.state,
     decided_by: t.approval.state === 'Approved' ? U.a3 : null, decided_at: t.approval.state === 'Approved' ? d(t.approval.at) : null, requested_at: d(t.createdAt),
   })));
@@ -446,11 +440,13 @@ export default async function seed({ conn, log, hashPassword, env, randomPasswor
   mkTask({ type: 'Problem task', problem: PRB[2], title: 'Test the vendor beta client v5.3 on a macOS 15 laptop', assignee: 'a2', team: 'sd', priority: 3, order: 0, state: 'Ready', due: now + 5 * DAY, createdAt: T(10) });
 
   // ---------- major incident ----------
-  const [mi] = await conn.query('INSERT INTO major_incidents (mi_number, ticket_id, title, status, commander_id, impact, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    ['MI-1', openMajor.id, openMajor.title, 'Active', U.a6, 'Kestrel Bank branch sign-ins are slow. Payments are not affected.', d(openMajor.createdAt)]);
-  await insertRows(conn, 'major_incident_updates', [
-    { major_incident_id: mi.insertId, user_id: U.a6, body: 'Major incident declared. Infrastructure is investigating replication between the two Frankfurt domain controllers.', created_at: d(openMajor.createdAt + 15 * MIN) },
-    { major_incident_id: mi.insertId, user_id: U.a6, body: 'Replication queue is draining slowly. Network path between the sites is being checked. Next update in 30 minutes.', created_at: d(Math.min(openMajor.createdAt + 140 * MIN, now - MIN)) },
+  const miId = await db.insertOne('major_incidents', {
+    mi_number: 'MI-1', ticket_id: openMajor.id, title: openMajor.title, status: 'Active', commander_id: U.a6,
+    impact: 'Kestrel Bank branch sign-ins are slow. Payments are not affected.', started_at: d(openMajor.createdAt),
+  });
+  await insertRows(db, 'major_incident_updates', [
+    { major_incident_id: miId, user_id: U.a6, body: 'Major incident declared. Infrastructure is investigating replication between the two Frankfurt domain controllers.', created_at: d(openMajor.createdAt + 15 * MIN) },
+    { major_incident_id: miId, user_id: U.a6, body: 'Replication queue is draining slowly. Network path between the sites is being checked. Next update in 30 minutes.', created_at: d(Math.min(openMajor.createdAt + 140 * MIN, now - MIN)) },
   ]);
 
   // ---------- changes ----------
@@ -475,27 +471,26 @@ export default async function seed({ conn, log, hashPassword, env, randomPasswor
   for (const [title, type, status, owner, cu, assetNames, startOff, hrs, [scope, down, tested, backout], dec, desc, ticketTitle, close] of changeDefs) {
     const score = scope + down + (tested ? 0 : 2) + (backout ? 0 : 2);
     const start = now + startOff * HOUR, end = start + hrs * HOUR;
-    const [res] = await conn.query(
-      `INSERT INTO changes (change_number, title, type, status, owner_id, customer_id, planned_start, planned_end, risk, risk_scope, risk_downtime, risk_tested, risk_backout,
-        description, implementation_plan, backout_plan, test_plan, close_code, close_notes, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [num('CHG', ++cn), title, type, status, U[owner], CUST[cu], d(start), d(end), score <= 3 ? 'Low' : score <= 5 ? 'Medium' : 'High', scope, down, tested ? 1 : 0, backout ? 1 : 0, desc,
-        '1. Notify affected users.\n2. Take a snapshot or configuration backup.\n3. Apply the change in the agreed window.\n4. Run the post-change checks.',
-        backout ? 'Restore the snapshot or configuration backup taken before the change.' : '', tested ? 'Tested in the staging environment last week with no issues.' : '',
-        close ? close[0] : null, close ? close[1] : null, U[owner], d(now - 6 * DAY), d(now - DAY)],
-    );
-    const id = res.insertId;
+    const id = await db.insertOne('changes', {
+      change_number: num('CHG', ++cn), title, type, status, owner_id: U[owner], customer_id: CUST[cu], planned_start: d(start), planned_end: d(end),
+      risk: score <= 3 ? 'Low' : score <= 5 ? 'Medium' : 'High', risk_scope: scope, risk_downtime: down, risk_tested: tested ? 1 : 0, risk_backout: backout ? 1 : 0,
+      description: desc,
+      implementation_plan: '1. Notify affected users.\n2. Take a snapshot or configuration backup.\n3. Apply the change in the agreed window.\n4. Run the post-change checks.',
+      backout_plan: backout ? 'Restore the snapshot or configuration backup taken before the change.' : '',
+      test_plan: tested ? 'Tested in the staging environment last week with no issues.' : '',
+      close_code: close ? close[0] : null, close_notes: close ? close[1] : null, created_by: U[owner], created_at: d(now - 6 * DAY), updated_at: d(now - DAY),
+    });
     CHG.push({ id, status, owner, start, end, close });
-    for (const n of assetNames) await conn.query('INSERT INTO change_assets (change_id, asset_id) VALUES (?, ?)', [id, A(n).id]);
-    await insertRows(conn, 'approvals', approvers.map(([who, role], i) => ({
+    for (const n of assetNames) await db.insertIgnore('change_assets', { change_id: id, asset_id: A(n).id });
+    await insertRows(db, 'approvals', approvers.map(([who, role], i) => ({
       approval_type: 'change', change_id: id, approver_id: U[who], approver_role: role, status: dec[i], is_requested: status === 'Draft' || status === 'Risk review' ? 0 : 1,
       decided_by: dec[i] === 'Pending' ? null : U[who], decided_at: dec[i] === 'Pending' ? null : d(now - DAY), sort_order: i, requested_at: d(now - 6 * DAY),
     })));
-    await conn.query('INSERT INTO change_activities (change_id, type, body, created_at) VALUES (?, ?, ?, ?)', [id, 'system', 'Change created', d(now - 6 * DAY)]);
-    if (close) await conn.query('INSERT INTO change_activities (change_id, type, body, created_at) VALUES (?, ?, ?, ?)', [id, 'system', `Closed (${close[0]})`, d(end)]);
+    await db.insertOne('change_activities', { change_id: id, type: 'system', body: 'Change created', created_at: d(now - 6 * DAY) });
+    if (close) await db.insertOne('change_activities', { change_id: id, type: 'system', body: `Closed (${close[0]})`, created_at: d(end) });
     if (ticketTitle) {
       const t = list.filter((x) => x.title.startsWith(ticketTitle)).sort((a, b) => b.createdAt - a.createdAt)[0];
-      if (t) await conn.query('UPDATE tickets SET change_id = ? WHERE id = ?', [id, t.id]);
+      if (t) await db.updateOne('tickets', { id: t.id }, { $set: { change_id: id } });
     }
     if (['Doing', 'Verify', 'Closed'].includes(status)) {
       ['Notify affected users', 'Take a snapshot or configuration backup', 'Apply the change', 'Run the post-change checks'].forEach((n, i) => {
@@ -509,9 +504,9 @@ export default async function seed({ conn, log, hashPassword, env, randomPasswor
 
   let tn = 0;
   tasks.sort((a, b) => a.created_at - b.created_at).forEach((t) => { t.task_number = num('TSK', ++tn); });
-  await insertRows(conn, 'tasks', tasks);
-  const [taskRows] = await conn.query('SELECT id, created_at FROM tasks');
-  await insertRows(conn, 'task_activities', taskRows.map((t) => ({ task_id: t.id, user_id: null, body: 'Task created', created_at: t.created_at })));
+  await insertRows(db, 'tasks', tasks);
+  const taskRows = await db.find('tasks', {}, { projection: { id: 1, created_at: 1 } });
+  await insertRows(db, 'task_activities', taskRows.map((t) => ({ task_id: t.id, user_id: null, body: 'Task created', created_at: t.created_at })));
   log(`${tasks.length} tasks`);
 
   // ---------- knowledge base ----------
@@ -532,12 +527,11 @@ export default async function seed({ conn, log, hashPassword, env, randomPasswor
   for (const [title, cat, aud, body, views, [h, nh], tags] of kb) {
     const draft = kn === kb.length - 1;
     const upd = now - Math.floor(R() * 60) * DAY;
-    const [res] = await conn.query(
-      `INSERT INTO knowledge_articles (article_number, title, category_id, audience, status, body, view_count, helpful_count, not_helpful_count, author_id, published_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [num('KB', ++kn), title, KBCAT[cat], aud, draft ? 'Draft' : 'Published', body, views, h, nh, U[pick(['a1', 'a2', 'a3', 'a4'])], draft ? null : d(upd), d(upd - 30 * DAY), d(upd)],
-    );
-    for (const tag of tags) await conn.query('INSERT INTO knowledge_article_tags (article_id, tag) VALUES (?, ?)', [res.insertId, tag]);
+    const id = await db.insertOne('knowledge_articles', {
+      article_number: num('KB', ++kn), title, category_id: KBCAT[cat], audience: aud, status: draft ? 'Draft' : 'Published', body, view_count: views,
+      helpful_count: h, not_helpful_count: nh, author_id: U[pick(['a1', 'a2', 'a3', 'a4'])], published_at: draft ? null : d(upd), created_at: d(upd - 30 * DAY), updated_at: d(upd),
+    });
+    for (const tag of tags) await db.insertIgnore('knowledge_article_tags', { article_id: id, tag });
   }
   log(`${kb.length} knowledge articles`);
 
@@ -549,14 +543,14 @@ export default async function seed({ conn, log, hashPassword, env, randomPasswor
   ];
   for (const [t, name, text] of files) {
     const meta = await writeUpload(Buffer.from(text, 'utf8'));
-    await conn.query(
-      'INSERT INTO attachments (entity_type, entity_id, original_name, stored_name, mime_type, extension, size_bytes, sha256, uploaded_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      ['ticket', t.id, name, meta.storedName, 'text/plain', name.split('.').pop(), meta.size, meta.sha256, t.assignee ? U[t.assignee] : U.a0, d(t.createdAt + 5 * MIN)],
-    );
+    await db.insertOne('attachments', {
+      entity_type: 'ticket', entity_id: t.id, original_name: name, stored_name: meta.storedName, mime_type: 'text/plain', extension: name.split('.').pop(),
+      size_bytes: meta.size, sha256: meta.sha256, uploaded_by: t.assignee ? U[t.assignee] : U.a0, created_at: d(t.createdAt + 5 * MIN),
+    });
   }
 
   // ---------- audit samples ----------
-  await insertRows(conn, 'audit_logs', [
+  await insertRows(db, 'audit_logs', [
     { user_id: U.a6, action: 'Declared major incident MI-1', entity_type: 'ticket', entity_id: String(openMajor.id), entity_ref: openMajor.number, created_at: d(now - 2 * HOUR) },
     { user_id: U.a4, action: 'Set priority to Critical', entity_type: 'ticket', entity_id: String(keyed.phish.id), entity_ref: keyed.phish.number, created_at: d(now - 90 * MIN) },
     { user_id: U.a3, action: 'Approved change', entity_type: 'change', entity_id: String(CHG[3].id), entity_ref: num('CHG', 4), created_at: d(now - 5 * HOUR) },
@@ -565,9 +559,12 @@ export default async function seed({ conn, log, hashPassword, env, randomPasswor
 
   // ---------- sequences ----------
   const seq = { INC: incN, REQ: reqN, TSK: tn, CHG: cn, PRB: problems.length, KB: kn, MI: 1 };
-  for (const [prefix, value] of Object.entries(seq)) {
-    await conn.query('INSERT INTO sequences (prefix, seq_year, last_value) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE last_value = GREATEST(last_value, VALUES(last_value))', [prefix, prefix === 'MI' ? 0 : YR, value]);
-  }
-  await conn.query('INSERT INTO sequences (prefix, seq_year, last_value) VALUES (?, 0, ?) ON DUPLICATE KEY UPDATE last_value = GREATEST(last_value, VALUES(last_value))', ['AST', an]);
+  const setSequence = (prefix, year, value) => db.collection('sequences').updateOne(
+    { prefix, seq_year: year },
+    { $max: { last_value: value }, $set: { updated_at: new Date() } },
+    { upsert: true },
+  );
+  for (const [prefix, value] of Object.entries(seq)) await setSequence(prefix, prefix === 'MI' ? 0 : YR, value);
+  await setSequence('AST', 0, an);
   log('sequences');
 }

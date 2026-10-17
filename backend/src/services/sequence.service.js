@@ -1,20 +1,26 @@
-import { queryOne, query } from '../config/database.js';
+import { collection, isDuplicateKey } from '../config/database.js';
 
 /**
  * Next record number for a prefix, generated inside the caller's transaction.
- * INSERT ... ON DUPLICATE KEY UPDATE takes a row lock on the sequence row, so
- * concurrent transactions queue up and each receives a unique value. If the
- * caller rolls back, the number is released with it (no gaps, no duplicates).
+ * The increment is a single atomic update of the sequence document, so
+ * concurrent callers each receive a unique value. In a transaction (replica
+ * set or MongoDB Atlas) a rollback releases the number with it.
  */
 export async function nextValue(conn, prefix, year) {
   if (!conn) throw new Error('nextValue must run inside a transaction');
-  await query(
-    `INSERT INTO sequences (prefix, seq_year, last_value) VALUES (?, ?, LAST_INSERT_ID(1))
-     ON DUPLICATE KEY UPDATE last_value = LAST_INSERT_ID(last_value + 1)`,
-    [prefix, year],
-    conn,
+  const options = { upsert: true, returnDocument: 'after', ...(conn.session && { session: conn.session }) };
+  const bump = () => collection('sequences').findOneAndUpdate(
+    { prefix, seq_year: year },
+    { $inc: { last_value: 1 }, $set: { updated_at: new Date() } },
+    options,
   );
-  return (await queryOne('SELECT LAST_INSERT_ID() AS v', [], conn)).v;
+  try {
+    return (await bump()).last_value;
+  } catch (err) {
+    // Two first-ever requests for a sequence can race on the upsert: retry once.
+    if (isDuplicateKey(err)) return (await bump()).last_value;
+    throw err;
+  }
 }
 
 /** INC-2026-0001 style numbers (yearly sequences). */

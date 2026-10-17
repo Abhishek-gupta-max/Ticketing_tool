@@ -1,10 +1,9 @@
-import { withTransaction } from '../config/database.js';
+import { withTransaction, findOne } from '../config/database.js';
 import * as repo from '../repositories/kb.repository.js';
 import * as audit from './audit.service.js';
 import { nextNumber } from './sequence.service.js';
 import * as map from '../models/mappers.js';
 import { notFound, forbidden } from '../utils/AppError.js';
-import { queryOne } from '../config/database.js';
 
 const tagsOf = (r) => (r.tags ? r.tags.split(',') : []);
 const canSeeInternal = (user) => user.can('kb:view_internal');
@@ -43,7 +42,7 @@ export async function get(number, user, { countView = true } = {}) {
 }
 
 async function categoryId(conn, id) {
-  const c = await queryOne('SELECT id FROM knowledge_categories WHERE id = ?', [id], conn);
+  const c = await findOne('knowledge_categories', { id }, { projection: { id: 1 } }, conn);
   if (!c) throw notFound('Category not found.');
   return c.id;
 }
@@ -63,8 +62,8 @@ export async function create(body, user) {
 /** Draft article from a resolved ticket (Resolve dialog option). */
 export async function createDraftFromTicket(conn, t, note, user) {
   const n = await nextNumber(conn, 'KB');
-  const cat = await queryOne('SELECT id FROM knowledge_categories WHERE name = ?', [t.category_name], conn)
-    || await queryOne('SELECT id FROM knowledge_categories ORDER BY sort_order LIMIT 1', [], conn);
+  const cat = await findOne('knowledge_categories', { name: t.category_name }, { projection: { id: 1 } }, conn)
+    || await findOne('knowledge_categories', {}, { sort: { sort_order: 1 }, projection: { id: 1 } }, conn);
   const id = await repo.insert({ number: n, title: t.title, categoryId: cat.id, audience: 'Public', status: 'Draft', body: `## Symptoms\n${t.description || ''}\n\n## Resolution\n${note}`, authorId: user.id }, conn);
   await repo.setTags(id, [t.category_name.split(' ')[0].toLowerCase()], conn);
   await audit.log({ action: 'Created article', entityType: 'article', entityId: id, entityRef: n, newValues: { fromTicket: t.ticket_number } }, conn);

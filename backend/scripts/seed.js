@@ -2,6 +2,7 @@
 // Usage: node scripts/seed.js [reference|demo]
 import { env } from '../src/config/env.js';
 import { runSeeds } from '../src/utils/seeder.js';
+import { closePool } from '../src/config/database.js';
 
 const kind = process.argv[2] || 'reference';
 if (!['reference', 'demo'].includes(kind)) {
@@ -19,5 +20,7 @@ try {
   console.log('Seeding complete.');
 } catch (err) {
   console.error('Seeding failed:', err.message);
-  process.exit(1);
+  process.exitCode = 1;
+} finally {
+  await closePool();
 }

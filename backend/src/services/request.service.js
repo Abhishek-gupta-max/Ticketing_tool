@@ -1,4 +1,6 @@
-import { withTransaction, queryOne } from '../config/database.js';
+import { withTransaction, find, findOne, count } from '../config/database.js';
+import { isMet } from '../utils/sla.js';
+import { DAY } from '../utils/time.js';
 import * as repo from '../repositories/request.repository.js';
 import * as catalogRepo from '../repositories/catalog.repository.js';
 import * as taskRepo from '../repositories/task.repository.js';
@@ -27,14 +29,18 @@ export async function catalog({ includeInactive = false } = {}) {
 }
 
 export async function kpis() {
-  const row = await queryOne(
-    `SELECT SUM(kind = 'request' AND status IN ('New','In Progress','On Hold','Awaiting approval')) AS open_items,
-            SUM(kind = 'request' AND status = 'Awaiting approval') AS pending,
-            SUM(kind = 'request' AND resolved_at > UTC_TIMESTAMP(3) - INTERVAL 30 DAY) AS fulfilled,
-            SUM(kind = 'request' AND resolved_at > UTC_TIMESTAMP(3) - INTERVAL 30 DAY AND resolved_at <= TIMESTAMPADD(SECOND, paused_seconds, sla_resolution_due_at)) AS on_time,
-            (SELECT COUNT(*) FROM tasks WHERE type = 'Catalog task' AND state NOT IN ('Done','Not done','Not needed')) AS open_tasks
-       FROM tickets WHERE deleted_at IS NULL`,
-  );
+  const requests = await find('tickets', { deleted_at: null, kind: 'request' }, {
+    projection: { status: 1, resolved_at: 1, paused_seconds: 1, sla_resolution_due_at: 1 },
+  });
+  const monthAgo = new Date(Date.now() - 30 * DAY);
+  const fulfilled = requests.filter((t) => t.resolved_at != null && t.resolved_at > monthAgo);
+  const row = {
+    open_items: requests.filter((t) => OPEN_STATUSES.includes(t.status)).length,
+    pending: requests.filter((t) => t.status === 'Awaiting approval').length,
+    fulfilled: fulfilled.length,
+    on_time: fulfilled.filter(isMet).length,
+    open_tasks: await count('tasks', { type: 'Catalog task', state: { $nin: ['Done', 'Not done', 'Not needed'] } }),
+  };
   return {
     openItems: Number(row.open_items || 0), pending: Number(row.pending || 0), openTasks: Number(row.open_tasks || 0),
     onTimePct: Number(row.fulfilled) ? Math.round((Number(row.on_time) / Number(row.fulfilled)) * 100) : 0,
@@ -68,7 +74,7 @@ export async function get(number, user) {
   const { rows } = await ticketRepo.list({ requestId: r.id, sortBy: 'number', sortOrder: 'ASC' }, user, { limit: 100, offset: 0 });
   const items = rows.map((x) => map.ticket(x));
   const tasks = user.isStaff ? (await taskRepo.byTickets(rows.map((x) => x.id))).map(map.task) : [];
-  const approvals = await Promise.all(rows.map((x) => queryOne('SELECT status FROM approvals WHERE ticket_id = ? ORDER BY id DESC LIMIT 1', [x.id])));
+  const approvals = await Promise.all(rows.map((x) => findOne('approvals', { ticket_id: x.id }, { sort: { id: -1 }, projection: { status: 1 } })));
   return {
     id: r.id, number: r.request_number, requestedFor: { id: r.requested_for_id, name: r.requested_for_name }, customer: { id: r.customer_id, name: r.customer_name },
     createdAt: r.created_at, isOpen: items.some((i) => OPEN_STATUSES.includes(i.status)),

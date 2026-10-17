@@ -1,7 +1,8 @@
 import * as repo from '../repositories/notification.repository.js';
 import * as settings from './settings.service.js';
-import { query, queryOne } from '../config/database.js';
-import { SQL_OPEN, SQL_BREACHED, SQL_RISK } from '../utils/sla.js';
+import { OPEN_STATUSES } from '../constants/workflow.js';
+import { find, count, distinct } from '../config/database.js';
+import { isOpen, isBreached, isRisk } from '../utils/sla.js';
 import * as approvalRepo from '../repositories/approval.repository.js';
 import * as miRepo from '../repositories/majorIncident.repository.js';
 import { logger } from '../config/logger.js';
@@ -31,22 +32,21 @@ export async function notifyMany(userIds, n, conn = null) {
 async function liveAlerts(user) {
   if (!user.isStaff) return [];
   const items = [];
-  const row = await queryOne(
-    `SELECT SUM(t.assigned_to = ? AND ${SQL_BREACHED}) AS br, SUM(t.assigned_to = ? AND ${SQL_RISK}) AS rk,
-            SUM(${SQL_OPEN} AND t.assigned_to IS NULL AND t.status = 'New' AND t.priority <= 2) AS un
-       FROM tickets t JOIN priorities pr ON pr.id = t.priority WHERE t.deleted_at IS NULL AND ${SQL_OPEN}`,
-    [user.id, user.id],
-  );
-  const br = Number(row.br || 0), rk = Number(row.rk || 0), un = Number(row.un || 0);
+  const [open, priorities] = await Promise.all([
+    find('tickets', { deleted_at: null, status: { $in: OPEN_STATUSES } }),
+    find('priorities', {}, { projection: { id: 1, resolution_minutes: 1 } }),
+  ]);
+  const policy = new Map(priorities.map((p) => [p.id, p.resolution_minutes]));
+  const tickets = open.filter((t) => policy.has(t.priority));
+  const br = tickets.filter((t) => t.assigned_to === user.id && isBreached(t)).length;
+  const rk = tickets.filter((t) => t.assigned_to === user.id && isRisk(t, policy.get(t.priority))).length;
+  const un = tickets.filter((t) => isOpen(t) && t.assigned_to == null && t.status === 'New' && t.priority <= 2).length;
   if (br) items.push({ key: 'breached', link: '/tickets?quick=breached', title: `${br} of your tickets have breached their SLA`, severity: 'bad' });
   if (rk) items.push({ key: 'risk', link: '/tickets?quick=risk', title: `${rk} of your tickets are close to breaching`, severity: 'warn' });
   if (un) items.push({ key: 'unassigned', link: '/tickets?quick=unassigned', title: `${un} high priority tickets are unassigned`, severity: 'warn' });
   const ap = (await approvalRepo.mine(user)).length;
   if (ap) items.push({ key: 'approvals', link: '/approvals', title: `${ap} approval${ap > 1 ? 's are' : ' is'} waiting for you`, severity: 'info' });
-  const ot = (await queryOne(
-    "SELECT COUNT(*) AS n FROM tasks WHERE assigned_to = ? AND state NOT IN ('Done','Not done','Not needed') AND due_at < UTC_TIMESTAMP(3)",
-    [user.id],
-  )).n;
+  const ot = await count('tasks', { assigned_to: user.id, state: { $nin: ['Done', 'Not done', 'Not needed'] }, due_at: { $lt: new Date() } });
   if (ot) items.push({ key: 'tasks', link: '/tasks?quick=overdue', title: `${ot} of your tasks are overdue`, severity: 'warn' });
   const mi = await miRepo.active();
   if (mi) items.push({ key: 'major', link: '/incidents', title: 'Major incident in progress: ' + mi.title, severity: 'bad' });
@@ -67,14 +67,12 @@ export const markRead = (user, id) => repo.markRead(id, user.id);
 export const markAllRead = (user) => repo.markAllRead(user.id);
 
 export async function staffUserIds() {
-  return (await query(
-    "SELECT u.id FROM users u JOIN roles r ON r.id = u.role_id WHERE u.status = 'active' AND r.name IN ('Admin','Manager','Agent')",
-  )).map((r) => r.id);
+  const roles = await distinct('roles', 'id', { name: { $in: ['Admin', 'Manager', 'Agent'] } });
+  return distinct('users', 'id', { status: 'active', role_id: { $in: roles } });
 }
 
 export async function approverUserIds() {
-  return (await query(
-    `SELECT DISTINCT u.id FROM users u JOIN role_permissions rp ON rp.role_id = u.role_id JOIN permissions p ON p.id = rp.permission_id
-      WHERE u.status = 'active' AND p.code = 'request:approve'`,
-  )).map((r) => r.id);
+  const perms = await distinct('permissions', 'id', { code: 'request:approve' });
+  const roles = await distinct('role_permissions', 'role_id', { permission_id: { $in: perms } });
+  return distinct('users', 'id', { status: 'active', role_id: { $in: roles } });
 }

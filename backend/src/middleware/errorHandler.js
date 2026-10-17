@@ -4,14 +4,15 @@ import { logger } from '../config/logger.js';
 import { env } from '../config/env.js';
 
 // Connection failures: the database host is wrong, unreachable or refusing us.
-const DB_UNREACHABLE = new Set(['ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'EHOSTUNREACH', 'PROTOCOL_CONNECTION_LOST', 'ER_ACCESS_DENIED_ERROR', 'ER_BAD_DB_ERROR', 'HANDSHAKE_SSL_ERROR']);
+const DB_UNREACHABLE = new Set(['MongoServerSelectionError', 'MongoNetworkError', 'MongoNetworkTimeoutError', 'MongoTopologyClosedError']);
+const isDbUnreachable = (err) => DB_UNREACHABLE.has(err?.name) || err?.code === 18; // 18: authentication failed
 
 export function notFoundHandler(req, res) {
   res.status(404).json({ success: false, message: 'The requested endpoint does not exist.', errorCode: 'ROUTE_NOT_FOUND' });
 }
 
-// Maps known low-level errors to safe messages. Raw database errors, SQL and
-// stack traces are logged but never sent to the client.
+// Maps known low-level errors to safe messages. Raw database errors and stack
+// traces are logged but never sent to the client.
 // eslint-disable-next-line no-unused-vars
 export function errorHandler(err, req, res, next) {
   let status = 500;
@@ -35,24 +36,17 @@ export function errorHandler(err, req, res, next) {
   } else if (err?.type === 'entity.parse.failed') {
     status = 400;
     body = { success: false, message: 'The request body is not valid JSON.', errorCode: 'INVALID_JSON' };
-  } else if (DB_UNREACHABLE.has(err?.code)) {
+  } else if (isDbUnreachable(err)) {
     status = 503;
     body = { success: false, message: 'The database is unavailable. Please try again later.', errorCode: 'DB_DOWN' };
-  } else if (err?.code === 'ER_DUP_ENTRY') {
+  } else if (err?.code === 11000) {
     status = 409;
     body = { success: false, message: 'A record with the same unique value already exists.', errorCode: 'DUPLICATE' };
-  } else if (err?.code === 'ER_ROW_IS_REFERENCED_2' || err?.code === 'ER_ROW_IS_REFERENCED') {
-    status = 409;
-    body = { success: false, message: 'This record is still used by other records.', errorCode: 'IN_USE' };
-  } else if (err?.code === 'ER_NO_REFERENCED_ROW_2') {
-    status = 400;
-    body = { success: false, message: 'A referenced record does not exist.', errorCode: 'INVALID_REFERENCE' };
   }
 
   const meta = { requestId: req.requestId, method: req.method, path: req.originalUrl, userId: req.user?.id, status };
   if (status >= 500) {
-    logger.error(err?.message || 'Unhandled error', { ...meta, code: err?.code, sqlState: err?.sqlState, stack: err?.stack });
-    if (err?.sqlMessage) logger.error('Database error', { requestId: req.requestId, sqlMessage: err.sqlMessage });
+    logger.error(err?.message || 'Unhandled error', { ...meta, code: err?.code, name: err?.name, stack: err?.stack });
   } else {
     logger.warn(body.message, { ...meta, errorCode: body.errorCode });
   }

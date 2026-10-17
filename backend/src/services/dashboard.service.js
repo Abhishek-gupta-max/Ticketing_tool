@@ -1,4 +1,5 @@
-import { queryOne } from '../config/database.js';
+import { OPEN_STATUSES } from '../constants/workflow.js';
+import { count } from '../config/database.js';
 import * as stats from '../repositories/stats.repository.js';
 import * as ticketRepo from '../repositories/ticket.repository.js';
 import * as taskRepo from '../repositories/task.repository.js';
@@ -58,19 +59,18 @@ export async function overview(user) {
 export async function navCounts(user) {
 
   if (!user.isStaff) {
-    const r = await queryOne("SELECT COUNT(*) AS n FROM tickets WHERE requester_id = ? AND deleted_at IS NULL AND status IN ('New','In Progress','On Hold','Awaiting approval')", [user.personId || -1]);
-    return { tickets: n(r.n) };
+    return { tickets: await count('tickets', { requester_id: user.personId || -1, deleted_at: null, status: { $in: OPEN_STATUSES } }) };
   }
-  const r = await queryOne(
-    `SELECT (SELECT COUNT(*) FROM tickets WHERE deleted_at IS NULL AND status IN ('New','In Progress','On Hold','Awaiting approval')) AS tickets,
-            (SELECT COUNT(*) FROM tickets WHERE deleted_at IS NULL AND kind = 'incident' AND status IN ('New','In Progress','On Hold','Awaiting approval')) AS incidents,
-            (SELECT COUNT(*) FROM tickets WHERE deleted_at IS NULL AND status = 'Awaiting approval') AS requests,
-            (SELECT COUNT(*) FROM problems WHERE deleted_at IS NULL AND status NOT IN ('Fixed','Closed')) AS problems,
-            (SELECT COUNT(*) FROM changes WHERE deleted_at IS NULL AND status = 'Approval') AS changes,
-            (SELECT COUNT(*) FROM tasks WHERE assigned_to = ? AND state NOT IN ('Done','Not done','Not needed','Waiting')) AS tasks,
-            (SELECT COUNT(*) FROM major_incidents WHERE status = 'Active') AS major`,
-    [user.id],
-  );
+  const [tickets, incidents, requests, problems, changes, tasks, major] = await Promise.all([
+    count('tickets', { deleted_at: null, status: { $in: OPEN_STATUSES } }),
+    count('tickets', { deleted_at: null, kind: 'incident', status: { $in: OPEN_STATUSES } }),
+    count('tickets', { deleted_at: null, status: 'Awaiting approval' }),
+    count('problems', { deleted_at: null, status: { $nin: ['Fixed', 'Closed'] } }),
+    count('changes', { deleted_at: null, status: 'Approval' }),
+    count('tasks', { assigned_to: user.id, state: { $nin: ['Done', 'Not done', 'Not needed', 'Waiting'] } }),
+    count('major_incidents', { status: 'Active' }),
+  ]);
+  const r = { tickets, incidents, requests, problems, changes, tasks, major };
   const approvals = (await approvalRepo.mine(user)).length;
   return { tickets: n(r.tickets), incidents: n(r.incidents), requests: n(r.requests), problems: n(r.problems), changes: n(r.changes), tasks: n(r.tasks), approvals, majorActive: n(r.major) > 0 };
 }

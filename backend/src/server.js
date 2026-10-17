@@ -9,7 +9,7 @@ async function main() {
     const db = await pingDatabase();
     logger.info('Database connected', { database: db.db, version: db.version });
   } catch (err) {
-    logger.error('Cannot connect to the database. Check DB_* settings in backend/.env', { code: err.code });
+    logger.error('Cannot connect to MongoDB. Check MONGODB_URI in backend/.env', { code: err.code });
     process.exit(1);
   }
 

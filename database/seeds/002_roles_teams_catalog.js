@@ -48,71 +48,69 @@ export const CATALOG = [
     tasks: ['Create guest voucher'] },
 ];
 
-export default async function seed({ conn, log, hashPassword, env, randomPassword, constants }) {
+export default async function seed({ db, log, hashPassword, env, randomPassword, constants }) {
   const { ROLE_DEFINITIONS, PERMISSION_DESCRIPTIONS } = constants;
+  const { insertIgnore, insertOne, findOne, count } = db;
 
   // Roles and permissions
   for (const [code, description] of Object.entries(PERMISSION_DESCRIPTIONS)) {
-    await conn.query('INSERT IGNORE INTO permissions (code, description) VALUES (?, ?)', [code, description]);
+    await insertIgnore('permissions', { code, description });
   }
   for (const role of ROLE_DEFINITIONS) {
-    await conn.query('INSERT IGNORE INTO roles (name, description) VALUES (?, ?)', [role.name, role.description]);
-    const [[r]] = await conn.query('SELECT id FROM roles WHERE name = ?', [role.name]);
+    await insertIgnore('roles', { name: role.name, description: role.description });
+    const r = await findOne('roles', { name: role.name });
     for (const code of role.permissions) {
-      await conn.query('INSERT IGNORE INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code = ?', [r.id, code]);
+      const p = await findOne('permissions', { code });
+      if (p) await insertIgnore('role_permissions', { role_id: r.id, permission_id: p.id });
     }
   }
   log('roles and permissions');
 
   // Teams and category routing
-  for (const t of TEAMS) {
-    await conn.query('INSERT IGNORE INTO teams (code, name, type, description, email) VALUES (?, ?, ?, ?, ?)', [t.code, t.name, t.type, t.description, t.email]);
-  }
+  for (const t of TEAMS) await insertIgnore('teams', { code: t.code, name: t.name, type: t.type, description: t.description, email: t.email });
   let order = 0;
   for (const [name, teamCode] of CATEGORIES) {
-    await conn.query(
-      'INSERT IGNORE INTO ticket_categories (name, default_team_id, sort_order) SELECT ?, id, ? FROM teams WHERE code = ?',
-      [name, ++order, teamCode],
-    );
+    const team = await findOne('teams', { code: teamCode });
+    order += 1;
+    if (team) await insertIgnore('ticket_categories', { name, default_team_id: team.id, sort_order: order });
   }
   log('teams and categories');
 
   // Service catalog
   order = 0;
   for (const c of CATALOG) {
-    await conn.query(
-      `INSERT IGNORE INTO catalog_items (code, name, category_id, icon, description, requires_approval, fulfilment_hours, sort_order)
-       SELECT ?, ?, id, ?, ?, ?, ?, ? FROM ticket_categories WHERE name = ?`,
-      [c.code, c.name, c.icon, c.desc, c.approval ? 1 : 0, c.hours, ++order, c.cat],
-    );
-    const [[item]] = await conn.query('SELECT id FROM catalog_items WHERE code = ?', [c.code]);
-    const [[{ n }]] = await conn.query('SELECT COUNT(*) AS n FROM catalog_fields WHERE catalog_item_id = ?', [item.id]);
-    if (!n) {
+    order += 1;
+    const category = await findOne('ticket_categories', { name: c.cat });
+    if (!category) continue;
+    await insertIgnore('catalog_items', {
+      code: c.code, name: c.name, category_id: category.id, icon: c.icon, description: c.desc, requires_approval: c.approval ? 1 : 0,
+      fulfilment_hours: c.hours, sort_order: order,
+    });
+    const item = await findOne('catalog_items', { code: c.code });
+    if (!(await count('catalog_fields', { catalog_item_id: item.id }))) {
       let i = 0;
       for (const f of c.fields) {
-        await conn.query(
-          'INSERT INTO catalog_fields (catalog_item_id, field_key, label, field_type, is_required, options, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)',
-          [item.id, f.k, f.l, f.t, f.req ? 1 : 0, f.o ? JSON.stringify(f.o) : null, ++i],
-        );
+        await insertOne('catalog_fields', {
+          catalog_item_id: item.id, field_key: f.k, label: f.l, field_type: f.t, is_required: f.req ? 1 : 0, options: f.o ? JSON.stringify(f.o) : null, sort_order: ++i,
+        });
       }
       i = 0;
-      for (const title of c.tasks) await conn.query('INSERT INTO catalog_tasks (catalog_item_id, title, sort_order) VALUES (?, ?, ?)', [item.id, title, ++i]);
+      for (const title of c.tasks) await insertOne('catalog_tasks', { catalog_item_id: item.id, title, sort_order: ++i });
     }
   }
   log('service catalog');
 
   // First administrator
-  const [[existing]] = await conn.query("SELECT u.id FROM users u JOIN roles r ON r.id = u.role_id WHERE r.name = 'Admin' LIMIT 1");
+  const adminRole = await findOne('roles', { name: 'Admin' });
+  const existing = await findOne('users', { role_id: adminRole.id });
   if (!existing) {
     const password = env.SEED_ADMIN_PASSWORD || randomPassword();
-    const [[role]] = await conn.query("SELECT id FROM roles WHERE name = 'Admin'");
-    const [res] = await conn.query(
-      'INSERT INTO users (role_id, name, email, password_hash, password_changed_at) VALUES (?, ?, ?, ?, UTC_TIMESTAMP(3))',
-      [role.id, 'Service Desk Admin', env.SEED_ADMIN_EMAIL, await hashPassword(password)],
-    );
-    const [[sd]] = await conn.query("SELECT id FROM teams WHERE code = 'sd'");
-    await conn.query('INSERT INTO agents (user_id, primary_team_id) VALUES (?, ?)', [res.insertId, sd.id]);
-    await conn.query('INSERT INTO team_members (team_id, user_id) VALUES (?, ?)', [sd.id, res.insertId]);
+    const userId = await insertOne('users', {
+      role_id: adminRole.id, name: 'Service Desk Admin', email: env.SEED_ADMIN_EMAIL, password_hash: await hashPassword(password), password_changed_at: new Date(),
+    });
+    const sd = await findOne('teams', { code: 'sd' });
+    await insertOne('agents', { user_id: userId, primary_team_id: sd.id });
+    await insertOne('team_members', { team_id: sd.id, user_id: userId });
     log(`administrator created: ${env.SEED_ADMIN_EMAIL}`);
     if (!env.SEED_ADMIN_PASSWORD) log(`generated admin password (shown once, change it after signing in): ${password}`);
   } else {

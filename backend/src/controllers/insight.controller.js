@@ -10,11 +10,10 @@ import * as notifications from '../services/notification.service.js';
 import * as attachments from '../services/attachment.service.js';
 import * as meta from '../services/meta.service.js';
 import * as audit from '../services/audit.service.js';
-import { withTransaction } from '../config/database.js';
+import { withTransaction, findOne, insertOne } from '../config/database.js';
 import { ok, created } from '../utils/response.js';
 import { sendCsv } from '../utils/csv.js';
 import { badRequest, unprocessable } from '../utils/AppError.js';
-import { queryOne } from '../config/database.js';
 
 const p = (req, k) => req.valid.params[k];
 const stamp = () => new Date().toISOString().slice(0, 10);
@@ -111,13 +110,13 @@ export const attachment = {
       await attachments.remove(conn, a.id);
       const text = `Removed attachment ${a.original_name}`;
       if (a.entity_type === 'ticket') {
-        const t = await queryOne('SELECT status, ticket_number FROM tickets WHERE id = ?', [a.entity_id], conn);
+        const t = await findOne('tickets', { id: a.entity_id }, { projection: { status: 1, ticket_number: 1 } }, conn);
         if (t.status === 'Closed') throw unprocessable('Closed tickets are read-only.');
-        await conn.query('INSERT INTO ticket_activities (ticket_id, user_id, body) VALUES (?, ?, ?)', [a.entity_id, req.user.id, text]);
+        await insertOne('ticket_activities', { ticket_id: a.entity_id, user_id: req.user.id, body: text }, conn);
       } else {
         const table = { problem: 'problem_activities', change: 'change_activities', task: 'task_activities' }[a.entity_type];
         const fk = { problem: 'problem_id', change: 'change_id', task: 'task_id' }[a.entity_type];
-        await conn.query(`INSERT INTO ${table} (${fk}, user_id, body) VALUES (?, ?, ?)`, [a.entity_id, req.user.id, text]);
+        await insertOne(table, { [fk]: a.entity_id, user_id: req.user.id, body: text }, conn);
       }
       await audit.log({ action: 'Removed attachment', entityType: a.entity_type, entityId: a.entity_id, entityRef: a.original_name }, conn);
     });

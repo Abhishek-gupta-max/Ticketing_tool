@@ -2,7 +2,7 @@
 // after sign-in and refreshed after settings change.
 import * as settingsRepo from '../repositories/settings.repository.js';
 import * as settings from './settings.service.js';
-import { query } from '../config/database.js';
+import { find, mapBy } from '../config/database.js';
 import { env } from '../config/env.js';
 import * as constants from '../constants/workflow.js';
 import { BLOCKED_EXT, allowedExtensions } from './attachment.service.js';
@@ -26,20 +26,18 @@ export async function meta(user) {
     requestResponseMinutes: all.settings.request_sla?.responseMinutes || constants.REQUEST_RESPONSE_MINUTES,
   };
   if (!user.isStaff) {
-    const customers = user.customerId ? await query('SELECT id, name, is_internal FROM customers WHERE id = ?', [user.customerId]) : [];
+    const customers = user.customerId ? await find('customers', { id: user.customerId }, { projection: { id: 1, name: 1, is_internal: 1 } }) : [];
     return { ...base, customers: customers.map((c) => ({ id: c.id, name: c.name, isInternal: !!c.is_internal })) };
   }
   const [customers, agents, teams] = await Promise.all([
-    query('SELECT id, name, plan, is_internal FROM customers WHERE deleted_at IS NULL ORDER BY is_internal, id'),
-    query(`SELECT u.id, u.name, u.email, r.name AS role, a.primary_team_id,
-                  (SELECT GROUP_CONCAT(team_id) FROM team_members tm WHERE tm.user_id = u.id) AS team_ids
-             FROM users u JOIN agents a ON a.user_id = u.id JOIN roles r ON r.id = u.role_id WHERE u.status = 'active' AND u.deleted_at IS NULL ORDER BY u.name`),
-    query('SELECT id, code, name, type, is_active FROM teams ORDER BY id'),
+    find('customers', { deleted_at: null }, { sort: { is_internal: 1, id: 1 }, projection: { id: 1, name: 1, plan: 1, is_internal: 1 } }),
+    activeAgents(),
+    find('teams', {}, { sort: { id: 1 }, projection: { id: 1, code: 1, name: 1, type: 1, is_active: 1 } }),
   ]);
   return {
     ...base,
     customers: customers.map((c) => ({ id: c.id, name: c.name, plan: c.plan, isInternal: !!c.is_internal })),
-    agents: agents.map((a) => ({ id: a.id, name: a.name, email: a.email, role: a.role, primaryTeamId: a.primary_team_id, teamIds: a.team_ids ? a.team_ids.split(',').map(Number) : [] })),
+    agents: agents.map((a) => ({ id: a.id, name: a.name, email: a.email, role: a.role, primaryTeamId: a.primary_team_id, teamIds: a.team_ids })),
     teams: teams.map((t) => ({ id: t.id, code: t.code, name: t.name, type: t.type, isActive: !!t.is_active })),
     holdReasons: lists.hold_reason || [],
     resolutionCodes: lists.resolution_code || [],
@@ -59,4 +57,19 @@ export async function meta(user) {
     changeTypes: constants.CHANGE_TYPES,
     canned: canned.map((c) => ({ id: c.id, name: c.name, body: c.body })),
   };
+}
+
+/** Active staff users with role, primary team and team ids, ordered by name. */
+async function activeAgents() {
+  const users = await find('users', { status: 'active', deleted_at: null }, { sort: { name: 1 }, projection: { id: 1, name: 1, email: 1, role_id: 1 } });
+  const ids = users.map((u) => u.id);
+  const [agents, roles, links] = await Promise.all([
+    mapBy('agents', ids, { key: 'user_id', projection: { primary_team_id: 1 } }),
+    mapBy('roles', users.map((u) => u.role_id), { projection: { name: 1 } }),
+    find('team_members', { user_id: { $in: ids } }, { projection: { user_id: 1, team_id: 1 } }),
+  ]);
+  return users.filter((u) => agents.has(u.id) && roles.has(u.role_id)).map((u) => ({
+    id: u.id, name: u.name, email: u.email, role: roles.get(u.role_id).name, primary_team_id: agents.get(u.id).primary_team_id,
+    team_ids: links.filter((l) => l.user_id === u.id).map((l) => l.team_id),
+  }));
 }

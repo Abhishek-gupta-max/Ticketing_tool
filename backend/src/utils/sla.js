@@ -47,13 +47,19 @@ export function slaRows(t, now = Date.now()) {
   ];
 }
 
-// ---------- SQL fragments (alias t = tickets, pr = priorities) ----------
-export const SQL_OPEN = "t.status IN ('New','In Progress','On Hold','Awaiting approval')";
-const RES_DUE = 'TIMESTAMPADD(SECOND, t.paused_seconds, t.sla_resolution_due_at)';
-const RUNNING = `${SQL_OPEN} AND t.status <> 'Awaiting approval' AND t.paused_at IS NULL`;
-export const SQL_BREACHED = `(${RUNNING} AND ((t.first_response_at IS NULL AND t.sla_response_due_at < UTC_TIMESTAMP(3)) OR ${RES_DUE} < UTC_TIMESTAMP(3)))`;
-export const SQL_RISK = `(${RUNNING} AND NOT ((t.first_response_at IS NULL AND t.sla_response_due_at < UTC_TIMESTAMP(3)) OR ${RES_DUE} < UTC_TIMESTAMP(3))
-  AND TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(3), ${RES_DUE}) < GREATEST(30, pr.resolution_minutes * 0.2))`;
-export const SQL_SLA_LEFT = `(CASE WHEN ${RUNNING} THEN TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(3), ${RES_DUE}) ELSE 999999999 END)`;
-export const SQL_MET = `(t.resolved_at IS NOT NULL AND t.resolved_at <= ${RES_DUE})`;
-export const SQL_PAUSED_REQUESTER = "(t.status = 'On Hold' AND t.paused_at IS NOT NULL)";
+// ---------- predicates used by queries and reports ----------
+// They reproduce the former SQL conditions exactly (t = ticket document,
+// resolutionMinutes = the priority's policy target).
+
+export const isOpen = (t) => OPEN_STATUSES.includes(t.status);
+const resDueMs = (t) => ms(t.sla_resolution_due_at) + (t.paused_seconds || 0) * 1000;
+/** Open, not awaiting approval and not paused: the SLA clock is running. */
+export const isRunning = (t) => isOpen(t) && t.status !== 'Awaiting approval' && t.paused_at == null;
+const overdue = (t, now) => (t.first_response_at == null && ms(t.sla_response_due_at) < now) || resDueMs(t) < now;
+export const isBreached = (t, now = Date.now()) => isRunning(t) && overdue(t, now);
+export const isRisk = (t, resolutionMinutes, now = Date.now()) => isRunning(t) && !overdue(t, now)
+  && Math.trunc((resDueMs(t) - now) / MIN) < Math.max(30, (resolutionMinutes || 0) * 0.2);
+/** Seconds until the resolution deadline while running (sort key); far future otherwise. */
+export const slaLeftSeconds = (t, now = Date.now()) => (isRunning(t) ? Math.trunc((resDueMs(t) - now) / 1000) : 999999999);
+export const isMet = (t) => t.resolved_at != null && ms(t.resolved_at) <= resDueMs(t);
+export const isPausedRequester = (t) => t.status === 'On Hold' && t.paused_at != null;

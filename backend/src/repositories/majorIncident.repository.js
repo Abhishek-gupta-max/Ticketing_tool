@@ -1,30 +1,35 @@
-import { query, queryOne } from '../config/database.js';
+import { insertOne, find, findOne, count, updateOne, attach } from '../config/database.js';
 
-const SELECT = `m.id, m.mi_number, m.ticket_id, t.ticket_number, m.title, m.status, m.commander_id, u.name AS commander_name, m.impact,
-  m.started_at, m.resolved_at, t.asset_id`;
-const FROM = 'FROM major_incidents m JOIN tickets t ON t.id = m.ticket_id LEFT JOIN users u ON u.id = m.commander_id';
-
-export const active = (conn) => queryOne(`SELECT ${SELECT} ${FROM} WHERE m.status = 'Active' ORDER BY m.started_at DESC LIMIT 1`, [], conn);
-export const activeForTicket = (ticketId) => queryOne(`SELECT ${SELECT} ${FROM} WHERE m.status = 'Active' AND m.ticket_id = ?`, [ticketId]);
-export const past = (limit = 5) => query(`SELECT ${SELECT} ${FROM} WHERE m.status = 'Resolved' ORDER BY m.started_at DESC LIMIT ?`, [limit]);
-export const total = async () => (await queryOne('SELECT COUNT(*) AS n FROM major_incidents')).n;
-export const findById = (id, conn) => queryOne(`SELECT ${SELECT} ${FROM} WHERE m.id = ?`, [id], conn);
-export const lockById = (id, conn) => queryOne('SELECT id FROM major_incidents WHERE id = ? FOR UPDATE', [id], conn);
-
-export async function insert(mi, conn) {
-  const res = await query(
-    'INSERT INTO major_incidents (mi_number, ticket_id, title, status, commander_id, impact) VALUES (?, ?, ?, \'Active\', ?, ?)',
-    [mi.number, mi.ticketId, mi.title, mi.commanderId, mi.impact],
-    conn,
-  );
-  return res.insertId;
+/** Major incident rows with ticket number, asset and commander name (former JOINs). */
+async function enrich(rows, conn) {
+  const list = Array.isArray(rows) ? rows : [rows].filter(Boolean);
+  await attach(list, 'tickets', 'ticket_id', { ticket_number: 'ticket_number', asset_id: 'asset_id' }, { conn });
+  await attach(list, 'users', 'commander_id', { commander_name: 'name' }, { conn });
+  return rows;
 }
 
-export const resolve = (id, conn) => query("UPDATE major_incidents SET status = 'Resolved', resolved_at = UTC_TIMESTAMP(3) WHERE id = ?", [id], conn);
+const one = async (filter, sort, conn) => enrich(await findOne('major_incidents', filter, { sort }, conn), conn);
 
-export const addUpdate = (id, userId, body, conn) => query('INSERT INTO major_incident_updates (major_incident_id, user_id, body) VALUES (?, ?, ?)', [id, userId, body], conn);
-export const updates = (id) => query(
-  `SELECT x.id, x.body, x.created_at, x.user_id, u.name AS user_name FROM major_incident_updates x LEFT JOIN users u ON u.id = x.user_id
-    WHERE x.major_incident_id = ? ORDER BY x.created_at DESC`,
-  [id],
-);
+export const active = (conn) => one({ status: 'Active' }, { started_at: -1 }, conn);
+export const activeForTicket = (ticketId) => one({ status: 'Active', ticket_id: ticketId });
+export const past = async (limit = 5) => enrich(await find('major_incidents', { status: 'Resolved' }, { sort: { started_at: -1 }, limit }));
+export const total = () => count('major_incidents');
+export const findById = (id, conn) => one({ id }, undefined, conn);
+export const lockById = (id, conn) => findOne('major_incidents', { id }, { projection: { id: 1 } }, conn);
+
+export const insert = (mi, conn) => insertOne('major_incidents', {
+  mi_number: mi.number, ticket_id: mi.ticketId, title: mi.title, status: 'Active', commander_id: mi.commanderId, impact: mi.impact,
+}, conn);
+
+export const resolve = (id, conn) => updateOne('major_incidents', { id }, { status: 'Resolved', resolved_at: new Date() }, conn);
+
+export const addUpdate = (id, userId, body, conn) => insertOne('major_incident_updates', { major_incident_id: id, user_id: userId, body }, conn);
+
+export async function updates(id) {
+  const rows = await find(
+    'major_incident_updates',
+    { major_incident_id: id },
+    { sort: { created_at: -1 }, projection: { id: 1, body: 1, created_at: 1, user_id: 1 } },
+  );
+  return attach(rows, 'users', 'user_id', { user_name: 'name' });
+}

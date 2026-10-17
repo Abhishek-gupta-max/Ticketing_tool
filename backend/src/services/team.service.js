@@ -1,4 +1,4 @@
-import { withTransaction, query } from '../config/database.js';
+import { withTransaction, find, findOne, updateOne, mapBy } from '../config/database.js';
 import * as repo from '../repositories/team.repository.js';
 import * as audit from './audit.service.js';
 import * as settings from './settings.service.js';
@@ -12,7 +12,11 @@ const shape = (t) => ({
 
 export async function list() {
   const teams = await repo.listTeams();
-  const oncall = await query('SELECT tm.team_id, u.id, u.name FROM team_members tm JOIN users u ON u.id = tm.user_id WHERE tm.is_on_call = 1 AND u.status = \'active\'');
+  const links = await find('team_members', { is_on_call: 1 }, { projection: { team_id: 1, user_id: 1 } });
+  const users = await mapBy('users', links.map((l) => l.user_id), { projection: { name: 1, status: 1 } });
+  const oncall = links
+    .filter((l) => users.get(l.user_id)?.status === 'active')
+    .map((l) => ({ team_id: l.team_id, id: l.user_id, name: users.get(l.user_id).name }));
   return teams.map((t) => ({ ...shape(t), onCall: oncall.filter((o) => o.team_id === t.id).map((o) => ({ id: o.id, name: o.name })) }));
 }
 
@@ -35,11 +39,11 @@ async function syncMembers(conn, teamId, memberIds, isEdit) {
   for (const uid of current) {
     if (memberIds.includes(uid)) continue;
     if (isEdit && (await repo.countTeamsOfUser(uid, conn)) <= 1) {
-      const u = (await query('SELECT name FROM users WHERE id = ?', [uid], conn))[0];
+      const u = await findOne('users', { id: uid }, { projection: { name: 1 } }, conn);
       throw unprocessable(`${u.name} would have no team. Add them to another team first.`);
     }
     await repo.removeMember(teamId, uid, conn);
-    await query('UPDATE agents SET primary_team_id = (SELECT team_id FROM team_members WHERE user_id = ? LIMIT 1) WHERE user_id = ? AND primary_team_id = ?', [uid, uid, teamId], conn);
+    await updateOne('agents', { user_id: uid, primary_team_id: teamId }, { primary_team_id: await repo.firstTeamOf(uid, conn) }, conn);
   }
   for (const uid of memberIds) if (!current.includes(uid)) await repo.addMember(teamId, uid, conn);
 }
@@ -93,7 +97,7 @@ export async function remove(id) {
         if (sd && sd.id !== id) await repo.addMember(sd.id, m.id, conn);
       }
       await repo.removeMember(id, m.id, conn);
-      await query('UPDATE agents SET primary_team_id = (SELECT team_id FROM team_members WHERE user_id = ? LIMIT 1) WHERE user_id = ?', [m.id, m.id], conn);
+      await updateOne('agents', { user_id: m.id }, { primary_team_id: await repo.firstTeamOf(m.id, conn) }, conn);
     }
     await repo.remove(id, conn);
     await audit.log({ action: `Deleted team ${t.name}`, entityType: 'team', entityId: id, entityRef: t.name }, conn);
@@ -104,7 +108,7 @@ export async function remove(id) {
 export async function addMember(id, userId) {
   const t = await repo.findById(id);
   if (!t) throw notFound('Team not found.');
-  const u = (await query("SELECT u.name FROM users u JOIN agents a ON a.user_id = u.id WHERE u.id = ? AND u.status = 'active'", [userId]))[0];
+  const u = (await findOne('agents', { user_id: userId })) ? await findOne('users', { id: userId, status: 'active' }, { projection: { name: 1 } }) : null;
   if (!u) throw badRequest('Choose an active agent.');
   await repo.addMember(id, userId);
   await audit.log({ action: `Added ${u.name} to ${t.name}`, entityType: 'team', entityId: id, entityRef: t.name });
@@ -114,12 +118,12 @@ export async function addMember(id, userId) {
 export async function removeMember(id, userId) {
   const t = await repo.findById(id);
   if (!t) throw notFound('Team not found.');
-  const u = (await query('SELECT name FROM users WHERE id = ?', [userId]))[0];
+  const u = await findOne('users', { id: userId }, { projection: { name: 1 } });
   if ((await repo.countTeamsOfUser(userId)) <= 1) throw unprocessable(`${u?.name} must belong to at least one team.`);
   await withTransaction(async (conn) => {
     await repo.removeMember(id, userId, conn);
-    await query('UPDATE agents SET primary_team_id = (SELECT team_id FROM team_members WHERE user_id = ? LIMIT 1) WHERE user_id = ? AND primary_team_id = ?', [userId, userId, id], conn);
-    if (t.manager_id === userId) await query('UPDATE teams SET manager_id = NULL WHERE id = ?', [id], conn);
+    await updateOne('agents', { user_id: userId, primary_team_id: id }, { primary_team_id: await repo.firstTeamOf(userId, conn) }, conn);
+    if (t.manager_id === userId) await updateOne('teams', { id }, { manager_id: null }, conn);
     await audit.log({ action: `Removed ${u?.name} from ${t.name}`, entityType: 'team', entityId: id, entityRef: t.name }, conn);
   });
   return get(id);
@@ -131,7 +135,7 @@ export async function setOnCall(id, userId, on) {
   if (t.type !== 'Support') throw unprocessable('Only support teams have an on-call rota.');
   if (!(await repo.isMember(id, userId))) throw badRequest('That agent is not in this team.');
   await repo.setOnCall(id, userId, on);
-  const u = (await query('SELECT name FROM users WHERE id = ?', [userId]))[0];
+  const u = await findOne('users', { id: userId }, { projection: { name: 1 } });
   await audit.log({ action: `${on ? 'On call' : 'Removed from on call'}: ${u?.name} (${t.name})`, entityType: 'team', entityId: id, entityRef: t.name });
   return get(id);
 }

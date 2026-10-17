@@ -1,4 +1,4 @@
-import { withTransaction } from '../config/database.js';
+import { withTransaction, find, findOne } from '../config/database.js';
 import * as repo from '../repositories/problem.repository.js';
 import * as ticketRepo from '../repositories/ticket.repository.js';
 import * as taskRepo from '../repositories/task.repository.js';
@@ -66,7 +66,7 @@ export async function createFromSuggestion(title, user) {
   const p = await withTransaction(async (conn) => {
     const list = await ticketRepo.similarWithoutProblem(title, 0);
     if (!list.length) throw unprocessable('There are no unlinked incidents with that summary.');
-    const pri = (await conn.query(`SELECT MIN(priority) AS p FROM tickets WHERE id IN (${list.map(() => '?').join(',')})`, list.map((t) => t.id)))[0][0].p;
+    const pri = Math.min(...(await find('tickets', { id: { $in: list.map((t) => t.id) } }, { projection: { priority: 1 } }, conn)).map((t) => t.priority));
     const created = await createInConnection(conn, { title, priority: pri }, user);
     for (const t of list) {
       await ticketRepo.update(t.id, { problem_id: created.id }, conn);
@@ -92,7 +92,7 @@ export async function update(number, body, user) {
     }
     if (body.ownerId !== undefined && body.ownerId !== p.owner_id) {
       f.owner_id = body.ownerId;
-      const u = (await conn.query('SELECT name FROM users WHERE id = ?', [body.ownerId]))[0][0];
+      const u = await findOne('users', { id: body.ownerId }, { projection: { name: 1 } }, conn);
       await activity.add('problem', p.id, user.id, `Assigned to ${u?.name || 'Unknown'}`, 'system', conn);
     }
     await repo.update(p.id, f, conn);

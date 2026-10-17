@@ -1,89 +1,77 @@
 # Database
 
-The application uses the MySQL / MariaDB database `tickenting_tools` (utf8mb4). Every table is created by the migrations in `database/migrations`; `database/schema.sql` is the same schema in one file, generated with `npm run db:schema`.
+The application uses MongoDB (tested with MongoDB 8.2 locally; MongoDB Atlas in the cloud). The database name is `MONGODB_DB` (default `Ticketing_tools`) on the server given by `MONGODB_URI` (default `mongodb://localhost:27017`).
 
-## Starting point
+The schema is defined in one file, `backend/src/config/collections.js`: every collection with its fields and defaults, unique keys and indexes. `npm run db:migrate` creates whatever is missing from it.
 
-Before this migration the `tickenting_tools` database existed but contained no tables (checked on MariaDB 10.4.32: `information_schema.tables` returned 0 rows), and the original application kept all data in the browser (`localStorage` key `veltrixsecure-servicedesk-v4`, attachments in IndexedDB). There was therefore no existing server data to migrate or preserve. The migrations only ever use `CREATE TABLE IF NOT EXISTS` / `CREATE OR REPLACE VIEW`; none drops a table or deletes rows.
-
-## Running migrations
+## Commands
 
 ```bash
-npm run db:migrate     # apply pending migrations (creates the database if missing)
-npm run db:status      # list applied / pending migrations
-npm run db:seed        # reference data: roles, permissions, priorities, lookups, teams, categories, catalog, first admin
-npm run db:seed:demo   # optional sample workspace (refuses to run with NODE_ENV=production)
-npm run db:schema      # regenerate database/schema.sql
+npm run db:migrate        # create missing collections and indexes (idempotent)
+npm run db:status         # list collections that exist / are missing
+npm run db:seed           # reference data: roles, permissions, priorities, lookups, teams, categories, catalog, first admin
+npm run db:seed:demo      # optional sample workspace (refuses to run with NODE_ENV=production)
+npm run db:import-mysql   # one-time copy of the former MySQL database (see below)
 ```
 
-Applied migrations are recorded in `schema_migrations` with a SHA-256 checksum; `db:migrate` warns if an applied file was edited later. To change the schema, add a new numbered file (for example `020_add_ticket_source.sql`); never edit an applied one. The runner understands `DELIMITER` blocks, so files also run unchanged in phpMyAdmin or the `mysql` client.
+Seeds are idempotent: unique keys make them skip records that already exist, so running them again only adds what is missing.
 
-## Tables
+## How the relational model maps to MongoDB
 
-| Area | Tables | Notes |
+The application was first built on MySQL. To keep the services, API responses and the React app unchanged, each former table is a collection with the **same field names** and the same values:
+
+- **Numeric ids.** Every document has a numeric `id` (MongoDB's own `_id` is never exposed). New ids come from the `counters` collection with an atomic `$inc`, so they are unique under concurrency. References between records (`customer_id`, `assigned_to`, `ticket_id`...) are these numeric ids.
+- **Defaults.** MongoDB has no column defaults, so `insertOne` in `backend/src/config/database.js` applies the defaults listed in `collections.js` (for example `status: 'New'`, `created_at: now`). Collections marked `touch` get `updated_at` refreshed on every update, which the former `ON UPDATE CURRENT_TIMESTAMP` did.
+- **Case-insensitive text.** Every collection is created with the collation `{ locale: 'en', strength: 2 }`, so equality, sorting and unique keys ignore case, as the MySQL `utf8mb4_unicode_ci` collation did (`Admin@x.com` and `admin@x.com` are the same email). Searches use case-insensitive regular expressions.
+- **Flags** stay `0` / `1` numbers and timestamps are UTC `Date` values. Date text given by the services (for example `2026-10-01` or `2026-10-01 09:00:00`) is stored as a UTC date.
+- **Joins.** Repositories load related records in batches (`attach` / `mapBy` in `database.js`) and return the same row shape the SQL joins returned, such as `assignee_name` or `customer_name`.
+- **Foreign key rules.** MongoDB does not enforce references. The services validate references before writing, as before, and the few hard deletes apply the former `ON DELETE` rules in code (deleting a team removes its memberships and clears it from tickets, tasks, assets and categories).
+
+## Collections
+
+| Area | Collections | Notes |
 |---|---|---|
-| Access control | `roles`, `permissions`, `role_permissions`, `users` | Granular permissions such as `ticket:create`; bcrypt password hashes; lockout and reset-token columns; `token_version` invalidates sessions. |
+| Access control | `roles`, `permissions`, `role_permissions`, `users` | Granular permissions such as `ticket:create`; bcrypt password hashes; lockout and reset-token fields; `token_version` invalidates sessions. |
 | Organisation | `teams`, `team_members`, `agents`, `customers`, `people` | An agent is a user with an `agents` profile and one or more team memberships (`is_on_call` per team). `people` are requesters of a customer, optionally linked to a portal login (`user_id`). |
-| Configuration | `priorities`, `ticket_categories`, `lookup_values`, `automation_rules`, `canned_responses`, `settings`, `sequences` | SLA targets per priority, routing per category (`default_team_id`), pick lists (channels, hold reasons, resolution codes...), rules r1-r5, key/value settings. |
+| Configuration | `priorities`, `ticket_categories`, `lookup_values`, `automation_rules`, `canned_responses`, `settings`, `sequences`, `counters` | SLA targets per priority, routing per category (`default_team_id`), pick lists, rules r1-r5, key/value settings (JSON text), record-number sequences and id counters. |
 | Tickets | `tickets`, `ticket_tags`, `ticket_comments`, `ticket_activities`, `ticket_history`, `major_incidents`, `major_incident_updates` | Incidents and request order items. Comments are replies (`comment`) or agent-only work notes (`note`); activities are system timeline lines; history is field-level old/new values. |
-| Requests and catalog | `catalog_items`, `catalog_fields`, `catalog_tasks`, `requests`, `request_items`, `request_item_values` | A request (`REQ-...`) has one or more order items; each item is a `tickets` row of kind `request` (`REQ-....1`) linked through `request_items`, with the submitted form answers in `request_item_values`. |
-| Tasks | `tasks`, `task_comments`, `task_activities` | Parent is a ticket, problem or change through three nullable foreign keys; a CHECK allows at most one. Sequential tasks open in order. |
+| Requests and catalog | `catalog_items`, `catalog_fields`, `catalog_tasks`, `requests`, `request_items`, `request_item_values` | A request (`REQ-...`) has one or more order items; each item is a `tickets` document of kind `request` linked through `request_items`, with the form answers in `request_item_values`. |
+| Tasks | `tasks`, `task_comments`, `task_activities` | Parent is a ticket, problem or change (`ticket_id` / `problem_id` / `change_id`, at most one set). Sequential tasks open in order. |
 | Problems | `problems`, `problem_activities` | Root cause, workaround, known error, resolution. |
 | Changes | `changes`, `change_assets`, `change_activities` | Plans, risk answers and score, schedule, close code. |
-| Approvals | `approvals` (+ view `change_approvals`) | One reusable table. `approval_type = 'request'` rows belong to a ticket (line manager); `'change'` rows are one per CAB approver. Status `Pending / Approved / Rejected / Cancelled`, approver, decider, comment, time. |
-| Assets | `asset_types`, `assets`, `asset_dependencies` | Tag, serial number, owner / user / manager / support team, department, location, purchase and warranty dates, dependencies (recursive CTE finds everything affected). |
-| Knowledge | `knowledge_categories`, `knowledge_articles`, `knowledge_article_tags`, `knowledge_article_votes`, `knowledge_article_views` | Draft / Published / Archived; one vote per user; one counted view per user per day. FULLTEXT index on title and body. |
-| Files | `attachments` (+ view `ticket_attachments`) | Metadata only: original name, random stored name, MIME type, size, SHA-256, uploader, parent record, optional comment. The bytes live in `UPLOAD_DIR`. |
-| Notifications | `notifications` | Per user, with a `dedupe_key` so background jobs never notify twice. |
-| Audit | `audit_logs` | User, action, entity, old/new values, IP address, user agent, request id, time. Triggers reject UPDATE and DELETE, so the log is append-only. |
+| Approvals | `approvals` | `approval_type = 'request'` documents belong to a ticket (line manager); `'change'` documents are one per CAB approver. |
+| Assets | `asset_types`, `assets`, `asset_dependencies` | Tag, serial number, owner / user / manager / support team, dates, dependencies (the "affected" list follows them up to 10 levels). |
+| Knowledge | `knowledge_categories`, `knowledge_articles`, `knowledge_article_tags`, `knowledge_article_votes`, `knowledge_article_views` | Draft / Published / Archived; one vote per user; one counted view per user per day. |
+| Files | `attachments` | Metadata only: original name, random stored name, MIME type, size, SHA-256, uploader, parent record. The bytes live in `UPLOAD_DIR`. |
+| Notifications | `notifications` | Per user, with a `dedupe_key` (unique per user when set) so background jobs never notify twice. |
+| Audit | `audit_logs` | User, action, entity, old/new values, IP address, user agent, request id, time. Append-only, see below. |
 | Reports | `report_schedules` | Scheduled report definitions. |
 
-## Design decisions
+## SLA figures
 
-- **Normalised relations, foreign keys everywhere.** Every reference is a foreign key with an explicit `ON DELETE` rule. Business records are soft-deleted (`deleted_at`) where users can delete them (tickets, assets, articles, attachments), so history and audit links stay valid.
-- **JSON only where a block is read and written as a unit:** `settings.value` (organisation, business hours, integrations...), `catalog_fields.options` (the choices of one select field) and `audit_logs.old_values/new_values` (a snapshot). Each has a `JSON_VALID` check. Everything that is queried or joined has its own columns and tables.
-- **Timestamps are UTC** (`DATETIME(3)`); the connection sets `time_zone = '+00:00'`. Reports convert to the organisation time zone with `CONVERT_TZ` using a numeric offset, so no time-zone tables are needed.
-- **Workflow states** (ticket, task, problem and change states) are enforced by CHECK constraints and by the service layer, because the business rules depend on them. Pure pick lists are rows in `lookup_values` and can be changed without code.
-- **SLA columns:** `sla_response_due_at` and `sla_resolution_due_at` are set at creation (and recalculated when an incident's priority changes). Time spent On Hold with the reason *Waiting for requester* is accumulated in `paused_seconds`; `paused_at` is set while the clock is stopped. Breached / at-risk filters are SQL expressions over these columns, so they work with pagination.
+`sla_response_due_at` and `sla_resolution_due_at` are set at creation. Time spent On Hold with *Waiting for requester* accumulates in `paused_seconds`; `paused_at` is set while the clock is stopped. "Breached", "at risk", "time left" and "SLA met" are defined once in `backend/src/utils/sla.js` and used by the ticket lists, quick-view counts, dashboard, notifications and reports, so every screen counts the same way. Simple filters and sorts run in MongoDB with indexes; the SLA-based views are evaluated in code on the matching open tickets.
 
 ## Record numbers
 
-`sequences (prefix, seq_year, last_value)` issues every business number. The creating transaction runs
-
-```sql
-INSERT INTO sequences (prefix, seq_year, last_value) VALUES (?, ?, LAST_INSERT_ID(1))
-ON DUPLICATE KEY UPDATE last_value = LAST_INSERT_ID(last_value + 1);
-SELECT LAST_INSERT_ID();
-```
-
-The upsert locks the sequence row until the transaction ends, so concurrent requests queue and each gets a unique value; if the transaction rolls back, the number is released with it. Unique keys on every `*_number` column are a second safety net. Yearly prefixes (INC, REQ, TSK, PRB, CHG, KB) restart each year; AST and MI use `seq_year = 0`.
+`sequences (prefix, seq_year, last_value)` issues every business number (INC, REQ, TSK, PRB, CHG, KB restart each year; AST and MI use `seq_year = 0`). Each number is one atomic `findOneAndUpdate` with `$inc`, so concurrent requests each get a unique value. Unique indexes on every `*_number` field are a second safety net.
 
 ## Transactions
 
-Multi-step operations run in one transaction (`withTransaction` in `backend/src/config/database.js`) and are rolled back completely on any error, including the audit entry. Examples: create ticket + activities + approval or catalog tasks + audit; submit request + request row + every order item + form values; approve a request + status + assignment + tasks; change transitions and CAB decisions; resolve a problem + its linked incidents; asset CSV import; attachment metadata (files already written are removed if the transaction fails). Records being changed are locked with `SELECT ... FOR UPDATE`.
+Multi-step operations run through `withTransaction` in `backend/src/config/database.js`:
 
-## Indexes
+- On a **replica set or MongoDB Atlas** they are real multi-document transactions: everything, including the audit entry and the record number, is committed together or rolled back on any error. Concurrent changes to the same record are detected by MongoDB and retried or rejected.
+- On a **standalone server** (a default local install) MongoDB has no multi-document transactions; the steps run in order, each one atomic. Validation still happens before anything is written, but a failure in the middle of a multi-step operation is not rolled back. Use a replica set (Atlas, or `mongod --replSet`) for production.
 
-Chosen for the queries the application runs, for example: `tickets` on `ticket_number` (unique), `status`, `priority`, `assigned_to`, `created_at`, `category_id`, `team_id`, `customer_id`, `requester_id`, `(kind, status)`, `resolved_at`, `updated_at`, `problem_id`, `asset_id`; `ticket_comments (ticket_id, created_at)`; `tasks (assigned_to, state)` and per parent; `approvals (approver_id, status)`; `notifications (user_id, is_read, created_at)`; `audit_logs (user_id)`, `(created_at)`, `(entity_type, entity_id)`; FULLTEXT on `tickets.title` and on article title and body.
+The automated tests pass in both modes.
 
-## From the original browser data model
+## Audit log
 
-| Original (`localStorage`) | Now |
-|---|---|
-| `db.tickets[]` with nested `activity[]`, `sla`, `approval`, `tags`, `form`, `attachments` | `tickets` + `ticket_comments` + `ticket_activities` + `ticket_history` + `approvals` + `ticket_tags` + `request_item_values` + `attachments` |
-| `db.requests[]` | `requests` + `request_items` |
-| `db.tasks[]` (`parent` string) | `tasks` with `ticket_id` / `problem_id` / `change_id` foreign keys |
-| `db.problems[]`, `db.changes[]` (with `approvals[]`, `assets[]`) | `problems`, `changes`, `change_assets`, `approvals`, activity tables |
-| `db.assets[]` (`dependsOn[]`) | `assets`, `asset_types`, `asset_dependencies` |
-| `db.kb[]` | `knowledge_articles` + tags / votes / views |
-| `db.agents[]`, `db.teams[]` (`onCall[]`), `db.customers[]`, `db.people[]` | `users` + `agents` + `team_members`, `teams`, `customers`, `people` |
-| `db.settings` (SLA, rules, routing, canned, notify, integrations, schedules) | `priorities`, `automation_rules`, `ticket_categories.default_team_id`, `canned_responses`, `settings`, `report_schedules` |
-| `db.audit[]` (capped at 400) | `audit_logs` (append-only, unlimited) |
-| `db.majors[]` | `major_incidents` + `major_incident_updates` |
-| `db.seq` | `sequences` |
-| `CATALOG`, `CAT_TASKS`, `CATS`, `CHANNELS`, `HOLD_REASONS`, ... constants | `catalog_*`, `ticket_categories`, `lookup_values` |
-| IndexedDB file blobs | files in `UPLOAD_DIR` + `attachments` metadata |
+`audit_logs` is append-only in the application: its repository only inserts and reads. MySQL also rejected changes with triggers; MongoDB has no triggers, so in production give the API a database user whose role allows only `find` and `insert` on `audit_logs` (MongoDB Atlas: Database Access > Custom Roles).
+
+## Moving the data from MySQL
+
+`npm run db:import-mysql` copies every table of the former MySQL database into the collection of the same name, keeping the ids, and sets the id counters so new records continue after the imported ones. It reads `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE` (or the old `DB_*` values in `backend/.env`) and writes to `MONGODB_URI` / `MONGODB_DB`. It stops if the MongoDB database already has data unless run with `--replace`. Run `npm run db:seed` afterwards to add any reference data the MySQL database lacked.
 
 ## Backups
 
-See [DEPLOYMENT.md](DEPLOYMENT.md#database-backup). Back up the database and the upload directory together; attachment rows refer to files by their stored name.
+See [DEPLOYMENT.md](DEPLOYMENT.md#database-backup). Back up the database and the upload directory together; attachment documents refer to files by their stored name.

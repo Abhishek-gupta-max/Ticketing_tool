@@ -1,106 +1,127 @@
-import { query, queryOne } from '../config/database.js';
+import { insertOne, insertMany, find, findOne, updateOne, updateMany, mapBy, attach } from '../config/database.js';
+import { DAY } from '../utils/time.js';
 
-export async function insertRequestApproval(ticketId, conn) {
-  const res = await query(
-    "INSERT INTO approvals (approval_type, ticket_id, approver_role, status) VALUES ('request', ?, 'Line manager', 'Pending')",
-    [ticketId],
-    conn,
-  );
-  return res.insertId;
-}
+export const insertRequestApproval = (ticketId, conn) => insertOne('approvals', {
+  approval_type: 'request', ticket_id: ticketId, approver_role: 'Line manager', status: 'Pending',
+}, conn);
 
 export async function insertChangeApprovals(changeId, approvers, conn) {
   if (!approvers.length) return;
-  await query(
-    'INSERT INTO approvals (approval_type, change_id, approver_id, approver_role, status, is_requested, sort_order) VALUES ?',
-    [approvers.map((a, i) => ['change', changeId, a.userId, a.role, 'Pending', 0, i])],
-    conn,
-  );
+  await insertMany('approvals', approvers.map((a, i) => ({
+    approval_type: 'change', change_id: changeId, approver_id: a.userId, approver_role: a.role, status: 'Pending', is_requested: 0, sort_order: i,
+  })), conn);
 }
 
-export const latestForTicket = (ticketId, conn) => queryOne(
-  `SELECT a.*, u.name AS decided_by_name FROM approvals a LEFT JOIN users u ON u.id = a.decided_by
-    WHERE a.ticket_id = ? ORDER BY a.id DESC LIMIT 1`,
-  [ticketId],
-  conn,
-);
+export async function latestForTicket(ticketId, conn) {
+  const a = await findOne('approvals', { ticket_id: ticketId }, { sort: { id: -1 } }, conn);
+  return a ? attach(a, 'users', 'decided_by', { decided_by_name: 'name' }, { conn }) : null;
+}
 
-export const forChange = (changeId, conn) => query(
-  `SELECT a.*, u.name AS approver_name, d.name AS decided_by_name FROM approvals a
-     LEFT JOIN users u ON u.id = a.approver_id LEFT JOIN users d ON d.id = a.decided_by
-    WHERE a.change_id = ? ORDER BY a.sort_order, a.id`,
-  [changeId],
-  conn,
-);
+export async function forChange(changeId, conn) {
+  const rows = await find('approvals', { change_id: changeId }, { sort: { sort_order: 1, id: 1 } }, conn);
+  await attach(rows, 'users', 'approver_id', { approver_name: 'name' }, { conn });
+  return attach(rows, 'users', 'decided_by', { decided_by_name: 'name' }, { conn });
+}
 
-export const findById = (id, conn) => queryOne('SELECT * FROM approvals WHERE id = ?', [id], conn);
-export const lockById = (id, conn) => queryOne('SELECT * FROM approvals WHERE id = ? FOR UPDATE', [id], conn);
+export const findById = (id, conn) => findOne('approvals', { id }, {}, conn);
+export const lockById = (id, conn) => findOne('approvals', { id }, {}, conn);
 
-export const decide = (id, status, userId, comment, conn) => query(
-  'UPDATE approvals SET status = ?, decided_by = ?, decided_at = UTC_TIMESTAMP(3), comment = ? WHERE id = ?',
-  [status, userId, comment || null, id],
-  conn,
-);
+export const decide = (id, status, userId, comment, conn) => updateOne('approvals', { id }, {
+  status, decided_by: userId, decided_at: new Date(), comment: comment || null,
+}, conn);
 
 /** Reset every approver of a change to pending and mark them as requested. */
-export const requestChange = (changeId, conn) => query(
-  "UPDATE approvals SET status = 'Pending', is_requested = 1, decided_by = NULL, decided_at = NULL, comment = NULL, requested_at = UTC_TIMESTAMP(3) WHERE change_id = ?",
-  [changeId],
-  conn,
-);
+export const requestChange = (changeId, conn) => updateMany('approvals', { change_id: changeId }, {
+  status: 'Pending', is_requested: 1, decided_by: null, decided_at: null, comment: null, requested_at: new Date(),
+}, conn);
 
 /** Standard change: approved by policy. */
-export const approveAllByPolicy = (changeId, conn) => query(
-  "UPDATE approvals SET status = 'Approved', is_requested = 1, decided_at = UTC_TIMESTAMP(3), comment = 'Pre-approved by policy' WHERE change_id = ?",
-  [changeId],
-  conn,
-);
+export const approveAllByPolicy = (changeId, conn) => updateMany('approvals', { change_id: changeId }, {
+  status: 'Approved', is_requested: 1, decided_at: new Date(), comment: 'Pre-approved by policy',
+}, conn);
 
-export const cancelPendingForChange = (changeId, conn) => query(
-  "UPDATE approvals SET status = 'Cancelled' WHERE change_id = ? AND status = 'Pending'",
-  [changeId],
-  conn,
-);
+export const cancelPendingForChange = (changeId, conn) => updateMany('approvals', { change_id: changeId, status: 'Pending' }, { status: 'Cancelled' }, conn);
 
 // ---------- queues ----------
-const REQUEST_PENDING = `SELECT 'request' AS kind, a.id AS approval_id, a.approver_role AS role, a.approver_id, NULL AS approver_name,
-    a.requested_at AS waiting_since, t.ticket_number AS record_number, t.title, t.id AS record_id,
-    rq.name AS requester_name, c.name AS customer_name
-  FROM approvals a JOIN tickets t ON t.id = a.ticket_id JOIN people rq ON rq.id = t.requester_id JOIN customers c ON c.id = t.customer_id
-  WHERE a.approval_type = 'request' AND a.status = 'Pending' AND t.status = 'Awaiting approval' AND t.deleted_at IS NULL`;
-
-const CHANGE_PENDING = `SELECT 'change' AS kind, a.id AS approval_id, a.approver_role AS role, a.approver_id, u.name AS approver_name,
-    ch.updated_at AS waiting_since, ch.change_number AS record_number, ch.title, ch.id AS record_id,
-    NULL AS requester_name, c.name AS customer_name
-  FROM approvals a JOIN changes ch ON ch.id = a.change_id LEFT JOIN users u ON u.id = a.approver_id LEFT JOIN customers c ON c.id = ch.customer_id
-  WHERE a.approval_type = 'change' AND a.status = 'Pending' AND ch.status = 'Approval' AND ch.deleted_at IS NULL`;
-
-/** Approvals the user may decide: request approvals (with request:approve) and their own CAB votes (or all, with override). */
-export function mine(user) {
-  const parts = [], params = [];
-  if (user.can('request:approve')) parts.push(REQUEST_PENDING);
-  if (user.can('approval:override')) parts.push(CHANGE_PENDING);
-  else if (user.can('change:approve')) { parts.push(CHANGE_PENDING + ' AND a.approver_id = ?'); params.push(user.id); }
-  if (!parts.length) return Promise.resolve([]);
-  return query(`${parts.join(' UNION ALL ')} ORDER BY waiting_since ASC`, params);
+async function requestPending() {
+  const rows = await find('approvals', { approval_type: 'request', status: 'Pending' });
+  const tickets = await mapBy('tickets', rows.map((a) => a.ticket_id), { projection: { ticket_number: 1, title: 1, status: 1, deleted_at: 1, requester_id: 1, customer_id: 1 } });
+  const live = rows.filter((a) => { const t = tickets.get(a.ticket_id); return t && t.status === 'Awaiting approval' && t.deleted_at == null; });
+  const [people, customers] = await Promise.all([
+    mapBy('people', live.map((a) => tickets.get(a.ticket_id).requester_id), { projection: { name: 1 } }),
+    mapBy('customers', live.map((a) => tickets.get(a.ticket_id).customer_id), { projection: { name: 1 } }),
+  ]);
+  return live
+    .filter((a) => people.has(tickets.get(a.ticket_id).requester_id) && customers.has(tickets.get(a.ticket_id).customer_id))
+    .map((a) => {
+      const t = tickets.get(a.ticket_id);
+      return {
+        kind: 'request', approval_id: a.id, role: a.approver_role, approver_id: a.approver_id, approver_name: null, waiting_since: a.requested_at,
+        record_number: t.ticket_number, title: t.title, record_id: t.id, requester_name: people.get(t.requester_id).name,
+        customer_name: customers.get(t.customer_id).name,
+      };
+    });
 }
 
-export const allPending = () => query(`${REQUEST_PENDING} UNION ALL ${CHANGE_PENDING} ORDER BY waiting_since ASC`);
+async function changePending(approverId) {
+  const rows = await find('approvals', { approval_type: 'change', status: 'Pending', ...(approverId != null && { approver_id: approverId }) });
+  const changes = await mapBy('changes', rows.map((a) => a.change_id), { projection: { change_number: 1, title: 1, status: 1, deleted_at: 1, updated_at: 1, customer_id: 1 } });
+  const live = rows.filter((a) => { const c = changes.get(a.change_id); return c && c.status === 'Approval' && c.deleted_at == null; });
+  const [users, customers] = await Promise.all([
+    mapBy('users', live.map((a) => a.approver_id), { projection: { name: 1 } }),
+    mapBy('customers', live.map((a) => changes.get(a.change_id).customer_id), { projection: { name: 1 } }),
+  ]);
+  return live.map((a) => {
+    const ch = changes.get(a.change_id);
+    return {
+      kind: 'change', approval_id: a.id, role: a.approver_role, approver_id: a.approver_id, approver_name: users.get(a.approver_id)?.name ?? null,
+      waiting_since: ch.updated_at, record_number: ch.change_number, title: ch.title, record_id: ch.id, requester_name: null,
+      customer_name: customers.get(ch.customer_id)?.name ?? null,
+    };
+  });
+}
 
-export const history = (days = 30) => query(
-  `SELECT a.id, a.approval_type AS kind, a.status AS decision, a.decided_at, a.approver_role AS role, a.comment,
-          COALESCE(t.ticket_number, ch.change_number) AS record_number, COALESCE(t.title, ch.title) AS title,
-          d.name AS decided_by_name
-     FROM approvals a
-     LEFT JOIN tickets t ON t.id = a.ticket_id LEFT JOIN changes ch ON ch.id = a.change_id LEFT JOIN users d ON d.id = a.decided_by
-    WHERE a.status IN ('Approved','Rejected') AND a.decided_at > UTC_TIMESTAMP(3) - INTERVAL ? DAY
-    ORDER BY a.decided_at DESC LIMIT 200`,
-  [days],
-);
+const byWaiting = (rows) => rows.sort((a, b) => new Date(a.waiting_since) - new Date(b.waiting_since));
 
-export const approvalHours = (from, to) => query(
-  `SELECT TIMESTAMPDIFF(SECOND, t.created_at, a.decided_at) / 3600 AS hours
-     FROM approvals a JOIN tickets t ON t.id = a.ticket_id
-    WHERE a.approval_type = 'request' AND a.status = 'Approved' AND a.decided_at IS NOT NULL AND t.created_at >= ? AND t.created_at < ?`,
-  [from, to],
-);
+/** Approvals the user may decide: request approvals (with request:approve) and their own CAB votes (or all, with override). */
+export async function mine(user) {
+  const parts = [];
+  if (user.can('request:approve')) parts.push(requestPending());
+  if (user.can('approval:override')) parts.push(changePending());
+  else if (user.can('change:approve')) parts.push(changePending(user.id));
+  if (!parts.length) return [];
+  return byWaiting((await Promise.all(parts)).flat());
+}
+
+export const allPending = async () => byWaiting((await Promise.all([requestPending(), changePending()])).flat());
+
+export async function history(days = 30) {
+  const rows = await find(
+    'approvals',
+    { status: { $in: ['Approved', 'Rejected'] }, decided_at: { $gt: new Date(Date.now() - days * DAY) } },
+    { sort: { decided_at: -1 }, limit: 200 },
+  );
+  const [tickets, changes, users] = await Promise.all([
+    mapBy('tickets', rows.map((a) => a.ticket_id), { projection: { ticket_number: 1, title: 1 } }),
+    mapBy('changes', rows.map((a) => a.change_id), { projection: { change_number: 1, title: 1 } }),
+    mapBy('users', rows.map((a) => a.decided_by), { projection: { name: 1 } }),
+  ]);
+  return rows.map((a) => {
+    const t = tickets.get(a.ticket_id), ch = changes.get(a.change_id);
+    return {
+      id: a.id, kind: a.approval_type, decision: a.status, decided_at: a.decided_at, role: a.approver_role, comment: a.comment,
+      record_number: t?.ticket_number ?? ch?.change_number ?? null, title: t?.title ?? ch?.title ?? null,
+      decided_by_name: users.get(a.decided_by)?.name ?? null,
+    };
+  });
+}
+
+export async function approvalHours(from, to) {
+  const rows = await find('approvals', { approval_type: 'request', status: 'Approved', decided_at: { $ne: null } }, { projection: { ticket_id: 1, decided_at: 1 } });
+  const tickets = await mapBy('tickets', rows.map((a) => a.ticket_id), { projection: { created_at: 1 } });
+  const f = new Date(from), t = new Date(to);
+  return rows
+    .filter((a) => { const k = tickets.get(a.ticket_id); return k && k.created_at >= f && k.created_at < t; })
+    // TIMESTAMPDIFF(SECOND, ...) / 3600: whole seconds, then hours
+    .map((a) => ({ hours: Math.trunc((a.decided_at - tickets.get(a.ticket_id).created_at) / 1000) / 3600 }));
+}

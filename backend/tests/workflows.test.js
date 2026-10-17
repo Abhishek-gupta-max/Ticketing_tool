@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { signIn, meta, ADMIN, MANAGER } from './helpers.js';
-import { closePool, query, queryOne } from '../src/config/database.js';
+import { closePool, count, findOne } from '../src/config/database.js';
+import * as auditRepo from '../src/repositories/audit.repository.js';
 
 let s, m;
 beforeAll(async () => { s = await signIn(ADMIN); m = await meta(s); });
@@ -14,10 +15,10 @@ describe('service requests and approvals', () => {
     const person = (await s.get('/api/v1/people?customerId=' + m.customers[0].id)).body.data[0];
 
     // missing required field -> nothing is created
-    const before = (await queryOne('SELECT COUNT(*) AS n FROM requests')).n;
+    const before = await count('requests');
     let r = await s.post('/api/v1/requests').send({ customerId: m.customers[0].id, requestedForId: person.id, items: [{ catalogItemId: licence.id, values: { app: 'Figma' } }] });
     expect(r.status).toBe(400);
-    expect((await queryOne('SELECT COUNT(*) AS n FROM requests')).n).toBe(before);
+    expect(await count('requests')).toBe(before);
 
     r = await s.post('/api/v1/requests').send({
       customerId: m.customers[0].id, requestedForId: person.id,
@@ -63,7 +64,7 @@ describe('service requests and approvals', () => {
     const r = await mgr.post(`/api/v1/tickets/${pending.number}/approval`).send({ decision: 'reject', comment: 'Not budgeted' });
     expect(r.body.data.status).toBe('Closed');
     expect(r.body.data.resolutionCode).toBe('Request rejected');
-    const ap = await queryOne('SELECT status, decided_by FROM approvals WHERE ticket_id = ? ORDER BY id DESC LIMIT 1', [pending.id]);
+    const ap = await findOne('approvals', { ticket_id: pending.id }, { sort: { id: -1 } });
     expect(ap.status).toBe('Rejected');
   });
 });
@@ -165,15 +166,16 @@ describe('knowledge base, assets, dashboard and audit', () => {
 
   it('serves a database-driven dashboard', async () => {
     const d = (await s.get('/api/v1/dashboard')).body.data;
-    const total = (await queryOne('SELECT COUNT(*) AS n FROM tickets WHERE deleted_at IS NULL')).n;
+    const total = await count('tickets', { deleted_at: null });
     expect(d.totals.total).toBe(total);
     expect(d.byPriority).toHaveLength(4);
     expect(d.sla.daily).toHaveLength(30);
   });
 
   it('keeps audit entries append-only', async () => {
-    const [row] = await query('SELECT id FROM audit_logs LIMIT 1');
-    await expect(query('UPDATE audit_logs SET action = ? WHERE id = ?', ['tampered', row.id])).rejects.toThrow(/append-only/);
-    await expect(query('DELETE FROM audit_logs WHERE id = ?', [row.id])).rejects.toThrow(/append-only/);
+    // MongoDB has no triggers: the application layer only ever inserts and reads
+    // audit entries (production can add a database role without update/delete).
+    expect(Object.keys(auditRepo).sort()).toEqual(['insert', 'list', 'recent']);
+    expect(await count('audit_logs')).toBeGreaterThan(0);
   });
 });
