@@ -205,11 +205,25 @@ export async function withTransaction(fn) {
   }
 }
 
+/** After a failed connection the client stays closed: drop it so the next call reconnects. */
+export async function resetAfterConnectionError(err) {
+  if (!/MongoServerSelectionError|MongoTopologyClosedError|MongoNetworkError|MongoNetworkTimeoutError/.test(err?.name || '')) return;
+  const old = client;
+  client = null;
+  supportsTransactions = null;
+  try { await old?.close(); } catch { /* already closed */ }
+}
+
 export async function pingDatabase() {
-  const db = getDb();
-  await db.command({ ping: 1 });
-  const info = await db.admin().command({ buildInfo: 1 });
-  return { db: db.databaseName, version: info.version };
+  try {
+    const db = getDb();
+    await db.command({ ping: 1 });
+    const info = await db.admin().command({ buildInfo: 1 });
+    return { db: db.databaseName, version: info.version };
+  } catch (err) {
+    await resetAfterConnectionError(err);
+    throw err;
+  }
 }
 
 export async function closePool() {

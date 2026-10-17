@@ -2,6 +2,7 @@ import multer from 'multer';
 import { AppError } from '../utils/AppError.js';
 import { logger } from '../config/logger.js';
 import { env } from '../config/env.js';
+import { resetAfterConnectionError } from '../config/database.js';
 
 // Connection failures: the database host is wrong, unreachable or refusing us.
 const DB_UNREACHABLE = new Set(['MongoServerSelectionError', 'MongoNetworkError', 'MongoNetworkTimeoutError', 'MongoTopologyClosedError']);
@@ -38,6 +39,7 @@ export function errorHandler(err, req, res, next) {
     body = { success: false, message: 'The request body is not valid JSON.', errorCode: 'INVALID_JSON' };
   } else if (isDbUnreachable(err)) {
     status = 503;
+    resetAfterConnectionError(err);
     body = { success: false, message: 'The database is unavailable. Please try again later.', errorCode: 'DB_DOWN' };
   } else if (err?.code === 11000) {
     status = 409;

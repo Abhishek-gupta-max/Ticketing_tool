@@ -34,7 +34,7 @@ function dbReason(err) {
   if (err?.code === 18 || /auth/i.test(text)) return 'MongoDB rejected the user name or password in MONGODB_URI.';
   if (/ENOTFOUND|EAI_AGAIN|querySrv/i.test(text)) return 'The host in MONGODB_URI was not found. Check the connection string.';
   if (/ECONNREFUSED/i.test(text)) return 'Connection refused: nothing is listening at MONGODB_URI (localhost is not reachable from a hosting service).';
-  if (err?.name === 'MongoServerSelectionError') return 'MongoDB did not answer. Check MONGODB_URI and that the database allows connections from this server (Atlas: Network Access).';
+  if (err?.name === 'MongoServerSelectionError' || err?.name === 'MongoTopologyClosedError') return 'MongoDB did not answer. Check MONGODB_URI and that the database allows connections from this server (Atlas: Network Access).';
   if (err?.name === 'MongoParseError') return 'MONGODB_URI is not a valid MongoDB connection string.';
   return err?.name ? `Database error ${err.name}` : 'Unknown database error';
 }
